@@ -1,7 +1,7 @@
 # ⚡ zog
 *A blisteringly fast, zero-allocation JSONL search engine.*
 
-**zog** is a high-performance command-line tool designed to query massive JSONL datasets at the physical speed limit of your hardware. By leveraging **memory mapping (mmap)** and **SIMD vector instructions**, it avoids the overhead of traditional JSON parsing to achieve near-instant results.
+**zog** is a high-performance command-line tool designed to query massive JSONL datasets at the physical speed limit of your hardware. It doesn't fully parse JSON, it blasts through it—giving you `jq`-like data extraction at `grep`-beating speeds.
 
 ---
 
@@ -13,7 +13,7 @@ Tested on a **1.0 GB JSONL file** (~15 million lines) on a modern NVMe SSD:
 |-----|-----------------|------------|
 | jq | 23.04s | 0.04 GB/s |
 | grep | 8.71s | 0.11 GB/s |
-| **zog** | **0.81s** | **1.23 GB/s** |
+| **zog** | **0.69s** | **1.46 GB/s** |
 
 ---
 
@@ -70,14 +70,30 @@ The binary will be located at:
 ./zig-out/bin/zog
 ```
 
-### 🧠 Why is it so fast?
+## 🧠 The "Blind Scanner" Architecture (Or: Why is it so fast?)
+
+Traditional JSON tools like `jq` build a full Abstract Syntax Tree (AST) to validate and understand the nested structure of your data. This is 100% accurate, but computationally expensive, which is why it bottlenecks at ~0.04 GB/s.
+
+`zog` takes a completely different approach. It acts as a **"Blind Scanner"**:
+
 ### 1. Zero-Copy I/O
-Standard tools copy data from the kernel into application buffers.
-`zog` uses mmap to map the file directly into the process address space, allowing the CPU to read data straight from the OS page cache.
-### 2. SIMD Newline Discovery
-Instead of checking every byte for `\n`, `zog` loads** 64-byte chunks** into **512-bit SIMD** registers and identifies line boundaries with a single instruction — skipping dozens of branches per cycle.
-### 3. No Heap Allocations
-`zog` does not use a traditional JSON parser. It scans raw bytes for `"key":"value"` patterns and performs zero heap allocations inside the hot search loop, resulting in a flat memory profile regardless of file size.
+Standard tools copy data from the OS kernel into application buffers. `zog` uses `mmap` to map the file directly into the process address space, allowing the CPU to read data straight from the OS page cache.
+
+### 2. SIMD Everything
+Instead of checking every byte one by one, `zog` loads 64-byte chunks of your log file into **512-bit SIMD** registers. It uses bitmasking (`@ctz`) to identify newlines and search keys simultaneously—skipping dozens of CPU branches per cycle.
+
+### 3. Zero Heap Allocations
+`zog` never allocates memory on the heap. It scans the raw bytes for `"key":"value"` patterns, intelligently skips whitespace and colons, counts backslashes to respect JSON escaping rules, and extracts your data in-place.
+
+### ⚠️ The Trade-off: False Positives
+Because `zog` processes raw bytes instead of building an AST state machine, it does not know if it is currently "inside" a string value. 
+
+This means it can theoretically hit perfectly formatted false positives. For example, if you search for `--key level --val error` in the following log:
+`{"event": "req", "payload": "{\"level\": \"error\"}", "level": "info"}`
+
+`zog` will return this line because the exact byte sequence `"level": "error"` exists inside the `payload` string.
+
+For incident response, DevOps telemetry, and massive log filtering, this is standard behavior (standard `grep` does the same thing). For most users, accepting this edge-case is well worth the **30x speedup** over full JSON parsers.
 
 
 ### 🧪 Running Benchmarks
