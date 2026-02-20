@@ -1,7 +1,7 @@
 .{
-    .name = .zog,
-    .version = "0.1.0",
-    .minimum_zig_version = "0.13.0", // Change this to 0.13.0
+    .name = "zog",          
+    .version = "0.1.0",     
+    .minimum_zig_version = "0.13.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
