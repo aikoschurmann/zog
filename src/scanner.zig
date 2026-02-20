@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
 
 /// Checks if a JSON line contains `"key": "val"`, ignoring spaces, tabs, or colons.
 fn lineMatches(line: []const u8, key_quoted: []const u8, val_quoted: []const u8) bool {
@@ -139,7 +141,10 @@ pub fn searchStream(key: []const u8, val: []const u8, pluck: ?[]const u8, writer
     }
 }
 
+
+
 /// Maps a physical file to memory and processes it using SIMD vectors.
+/// Works on Windows (FileMapping), Linux, and macOS (mmap).
 pub fn searchFile(file_path: []const u8, key: []const u8, val: []const u8, pluck: ?[]const u8, writer: anytype) !void {
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
@@ -147,11 +152,42 @@ pub fn searchFile(file_path: []const u8, key: []const u8, val: []const u8, pluck
     const file_size = (try file.metadata()).size();
     if (file_size == 0) return;
 
-    const file_contents = try std.posix.mmap(
-        null, file_size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0,
-    );
-    defer std.posix.munmap(file_contents);
+    // --- PLATFORM-SPECIFIC MEMORY MAPPING ---
+    var file_contents: []const u8 = undefined;
 
+    if (builtin.os.tag == .windows) {
+        const w = std.os.windows;
+        // 1. Create a file mapping object
+        const h_map = try w.CreateFileMapping(file.handle, null, w.PAGE_READONLY, 0, 0, null);
+        defer w.CloseHandle(h_map);
+
+        // 2. Map the view of the file into the process's address space
+        const ptr = try w.MapViewOfFile(h_map, w.FILE_MAP_READ, 0, 0, file_size);
+        file_contents = @as([*]const u8, @ptrCast(ptr))[0..file_size];
+    } else {
+        // POSIX path (Linux/macOS)
+        file_contents = try std.posix.mmap(
+            null,
+            file_size,
+            std.posix.PROT.READ,
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+    }
+
+    // Ensure we unmap correctly based on the OS
+    defer {
+        if (builtin.os.tag == .windows) {
+            std.os.windows.UnmapViewOfFile(file_contents.ptr);
+        } else {
+            // FIX: Use @alignCast to restore the alignment required by munmap
+            std.posix.munmap(@alignCast(file_contents));
+        }
+    }
+    // ----------------------------------------
+
+    // 3. SETUP QUOTED NEEDLES
     var key_buf: [128]u8 = undefined;
     const key_quoted = try std.fmt.bufPrint(&key_buf, "\"{s}\"", .{key});
 
@@ -164,6 +200,7 @@ pub fn searchFile(file_path: []const u8, key: []const u8, val: []const u8, pluck
         pluck_quoted = try std.fmt.bufPrint(&pluck_buf, "\"{s}\"", .{p});
     }
 
+    // 4. SIMD SCANNING ENGINE
     const vector_len = 64;
     const V = @Vector(vector_len, u8);
     const newline_vec: V = @splat('\n');
@@ -193,10 +230,9 @@ pub fn searchFile(file_path: []const u8, key: []const u8, val: []const u8, pluck
         }
     }
 
-    // Process the final tail of the file
+    // 5. CLEANUP TAIL
     if (start_of_line < file_contents.len) {
         const raw_tail = file_contents[start_of_line..];
-        // We trim the right to avoid double-newlines and ghost results
         const last_line = std.mem.trimRight(u8, raw_tail, "\r\n");
         
         if (last_line.len > 0 and lineMatches(last_line, key_quoted, val_quoted)) {
