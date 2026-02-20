@@ -1,0 +1,5 @@
+zig-out/
+.zig-cache/
+bench_data.jsonl
+api_logs.jsonl
+test.jsonl
