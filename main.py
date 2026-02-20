@@ -91,9 +91,9 @@ def main():
         "grep (pipe)": f"cat {FILE_NAME} | grep '\"level\": \"error\"'",
     }
 
-    if check_tool("jq"):
-        scenarios["jq (file)"] = jq_cmd
-        scenarios["jq (pipe)"] = f"cat {FILE_NAME} | jq -c 'select(.level == \"error\")'"
+    #if check_tool("jq"):
+    #    scenarios["jq (file)"] = jq_cmd
+    #    scenarios["jq (pipe)"] = f"cat {FILE_NAME} | jq -c 'select(.level == \"error\")'"
 
     results = []
     for name, cmd in scenarios.items():

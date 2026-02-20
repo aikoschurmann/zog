@@ -9,13 +9,11 @@
 
 Tested on a **1.0 GB JSONL file** (~15 million lines) on a modern NVMe SSD:
 
-| Tool | Wall-Clock Time | Throughput | CPU Load |
-|-----|-----------------|------------|----------|
-| jq | 23.04s | 0.04 GB/s | 99% |
-| grep | 8.71s | 0.11 GB/s | 97% |
-| **zog** | **0.75s** | **1.33 GB/s** | **61%** |
-
-> **Note:** At 1.33 GB/s, zog is effectively **I/O bound**, meaning it processes data as fast as the operating system can feed it from the disk cache.
+| Tool | Wall-Clock Time | Throughput |
+|-----|-----------------|------------|
+| jq | 23.04s | 0.04 GB/s |
+| grep | 8.71s | 0.11 GB/s |
+| **zog** | **0.81s** | **1.23 GB/s** |
 
 ---
 

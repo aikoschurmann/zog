@@ -40,4 +40,3 @@ jobs:
           files: |
             zog-linux-amd64
             zog-macos-arm64
-            zog-windows-amd64.exe
