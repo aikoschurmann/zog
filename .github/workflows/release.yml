@@ -33,10 +33,6 @@ jobs:
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
           mv zig-out/bin/zog zog-macos-arm64
 
-      - name: Build Windows (x86_64)
-        run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows
-          mv zig-out/bin/zog.exe zog-windows-amd64.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

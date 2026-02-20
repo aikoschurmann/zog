@@ -52,7 +52,7 @@ cat large_data.jsonl | ./zog --key status --val 500 --pluck message
 ### 📦 Installation
 `zog` is a single, static binary with zero dependencies.
 ### Download Prebuilt Binary
-Download the latest binary for your OS from the Releases page.
+Download the latest binary for your OS from the Releases page (windows not yet supported).
 ```bash
 # Example for macOS (Apple Silicon)
 curl -L https://github.com/aikoschurmann/zog/releases/latest/download/zog-macos-arm64 -o zog
