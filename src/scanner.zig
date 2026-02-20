@@ -38,7 +38,7 @@ fn extractValue(line: []const u8, pluck_key_quoted: []const u8) ?[]const u8 {
         const start = i;
         while (i < rest.len) : (i += 1) {
             const c = rest[i];
-$            if (c == ',' or c == '}' or c == ' ' or c == '\r' or c == '\n') {
+            if (c == ',' or c == '}' or c == ' ' or c == '\r' or c == '\n') {
                 return rest[start..i];
             }
         }
