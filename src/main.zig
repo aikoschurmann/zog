@@ -1,5 +1,5 @@
 const std = @import("std");
-const Scanner = @import("Scanner.zig");
+const Scanner = @import("scanner.zig");
 
 const Config = struct {
     file_path: ?[]const u8 = null, // Now optional!
