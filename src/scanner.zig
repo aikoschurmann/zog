@@ -319,8 +319,6 @@ inline fn extractValueSingle(line: []const u8, pk_quoted: []const u8) ?[]const u
     return null;
 }
 
-
-
 fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, format: main.OutputFormat, writer: anytype) !void {
     // 8KB Stack buffer to build the line without function call overhead
     var buf: [8192]u8 = undefined;
@@ -489,37 +487,29 @@ fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, wri
             const full_key = search[0 .. end_quote_idx.? + 2];
             search = search[end_quote_idx.? + 2 ..];
             
-            // 1. Check if this key matches ANY field we want to extract
-            var wants_key = false;
+            var matched_idx: ?usize = null;
             for (pluck_keys[0..max_keys], 0..) |pk, i| {
                 if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
-                    wants_key = true;
+                    matched_idx = i;
                     break;
                 }
             }
             
-            if (wants_key) {
-                if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos| {
-                    if (search[colon_pos] == ':') {
-                        const rest = search[colon_pos + 1 ..];
-                        if (std.mem.indexOfNone(u8, rest, " \t")) |val_start| {
-                            if (extractValueFromRest(rest[val_start..])) |val| {
-                                
-                                // 2. Assign the value to ALL aggregations targeting this key
-                                for (pluck_keys[0..max_keys], 0..) |pk, i| {
-                                    if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
-                                        results[i] = val;
-                                        found_count += 1;
-                                    }
-                                }
-                                
-                                if (rest[val_start] == '"') {
-                                    search = rest[val_start + val.len + 2 ..]; 
-                                } else {
-                                    search = rest[val_start + val.len ..];
-                                }
-                                continue;
+            if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos| {
+                if (search[colon_pos] == ':') {
+                    const rest = search[colon_pos + 1 ..];
+                    if (std.mem.indexOfNone(u8, rest, " \t")) |val_start| {
+                        if (extractValueFromRest(rest[val_start..])) |val| {
+                            if (matched_idx) |idx| {
+                                results[idx] = val;
+                                found_count += 1;
                             }
+                            if (rest[val_start] == '"') {
+                                search = rest[val_start + val.len + 2 ..]; 
+                            } else {
+                                search = rest[val_start + val.len ..];
+                            }
+                            continue;
                         }
                     }
                 }
