@@ -1,0 +1,10 @@
+zig-out/
+.zig-cache/
+bench_data.jsonl
+api_logs.jsonl
+test.jsonl
+zog
+chaos_data.jsonl
+main2.py
+sad.txt
+demo.jsonl
