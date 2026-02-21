@@ -4,9 +4,6 @@ const main = @import("main.zig");
 // ==========================================
 // QUERY COMPILER & EVALUATOR
 // ==========================================
-// ==========================================
-// QUERY COMPILER & EVALUATOR
-// ==========================================
 
 const CompiledCondition = struct {
     key_quoted: []const u8,
@@ -263,9 +260,6 @@ pub fn searchFile(allocator: std.mem.Allocator, file_path: []const u8, groups: [
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
-    const F_NOCACHE: i32 = 48;
-    _ = std.posix.system.fcntl(file.handle, F_NOCACHE, @as(i32, 1));
-
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const plan = try compilePlan(arena.allocator(), groups, pluck);
@@ -395,4 +389,136 @@ pub fn searchStream(allocator: std.mem.Allocator, groups: []const main.Condition
         } else bytes_in_buffer = 0;
         if (read_count == 0) break;
     }
+}
+// ==========================================
+// TEST SUITE
+// ==========================================
+
+const testing = std.testing;
+
+// Helper to compile a single key-val condition and test a JSON line against it
+fn expectMatch(line: []const u8, key: []const u8, val: []const u8, expected: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // 1. Create a mutable array of conditions
+    var conds = [_]main.Condition{.{ .key = key, .val = val }};
+    
+    // 2. Create a mutable array of groups pointing to our conditions
+    var groups = [_]main.ConditionGroup{.{ .conditions = &conds }};
+    
+    // 3. Compile the plan
+    const plan = try compilePlan(arena.allocator(), &groups, null);
+    
+    const result = evaluatePlan(line, plan);
+    if (result != expected) {
+        std.debug.print("\nFAIL:\n  Line: {s}\n  Key: {s}\n  Val: {s}\n  Expected: {}\n  Got: {}\n", .{line, key, val, expected, result});
+    }
+    try testing.expectEqual(expected, result);
+}
+
+// Helper to test pluck extraction
+fn expectPluck(line: []const u8, pluck_key: []const u8, expected: ?[]const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const pk_quoted = try std.fmt.allocPrint(arena.allocator(), "\"{s}\"", .{pluck_key});
+    const result = extractValue(line, pk_quoted);
+    
+    if (expected) |exp| {
+        try testing.expect(result != null);
+        try testing.expectEqualStrings(exp, result.?);
+    } else {
+        try testing.expect(result == null);
+    }
+}
+
+test "Scanner: Standard String Matching" {
+    // Exact matches
+    try expectMatch("{\"level\": \"error\"}", "level", "error", true);
+    try expectMatch("{\"service\": \"auth-api\", \"level\": \"error\"}", "service", "auth-api", true);
+    
+    // Substring trap: value shouldn't match if it's just a prefix in the JSON
+    try expectMatch("{\"level\": \"error\"}", "level", "err", false);
+    
+    // Key substring trap: make sure key isn't a substring match
+    try expectMatch("{\"sublevel\": \"error\"}", "level", "error", false);
+}
+
+test "Scanner: Number Primitives & Boundaries" {
+    // Exact integer matches
+    try expectMatch("{\"load\": 99}", "load", "99", true);
+    try expectMatch("{\"load\": -42}", "load", "-42", true);
+    try expectMatch("{\"load\": 0}", "load", "0", true);
+
+    // Exact float matches
+    try expectMatch("{\"load\": 99.0}", "load", "99.0", true);
+    try expectMatch("{\"load\": 99.55}", "load", "99.55", true);
+
+    // Decimal boundary traps (Should FAIL)
+    try expectMatch("{\"load\": 99.0}", "load", "99", false);
+    try expectMatch("{\"load\": 99.5}", "load", "99", false);
+    
+    // Adjacent number traps (Should FAIL)
+    try expectMatch("{\"load\": 995}", "load", "99", false);
+    try expectMatch("{\"load\": 199}", "load", "99", false);
+
+    // Valid JSON boundaries for primitives
+    try expectMatch("{\"load\": 99}", "load", "99", true); 
+    try expectMatch("{\"load\": 99, \"other\": 1}", "load", "99", true); 
+    try expectMatch("[{\"load\": 99}]", "load", "99", true); 
+    try expectMatch("{\"load\": 99 \n}", "load", "99", true); 
+}
+
+test "Scanner: Boolean and Null Primitives" {
+    // Exact matches
+    try expectMatch("{\"active\": true}", "active", "true", true);
+    try expectMatch("{\"active\": false}", "active", "false", true);
+    try expectMatch("{\"user\": null}", "user", "null", true);
+
+    // Substring trap (Should FAIL)
+    try expectMatch("{\"active\": trueFalse}", "active", "true", false);
+    try expectMatch("{\"active\": true123}", "active", "true", false);
+}
+
+test "Scanner: Explicit Quoting (Overrides)" {
+    // User searches for the STRING "99" (passed as '"99"' from shell)
+    try expectMatch("{\"load\": \"99\"}", "load", "\"99\"", true);
+    try expectMatch("{\"load\": 99}", "load", "\"99\"", false); // It's a number in JSON
+
+    // User searches for the STRING "true" (passed as '"true"' from shell)
+    try expectMatch("{\"active\": \"true\"}", "active", "\"true\"", true);
+    try expectMatch("{\"active\": true}", "active", "\"true\"", false); // It's a bool in JSON
+}
+
+test "Scanner: Whitespace and Formatting Resilience" {
+    // Spacing between key, colon, and value
+    try expectMatch("{\"load\" : 99}", "load", "99", true);
+    try expectMatch("{\"load\":  99}", "load", "99", true);
+    try expectMatch("{\"load\"   :   99}", "load", "99", true);
+    try expectMatch("{\"level\" : \"error\"}", "level", "error", true);
+
+    // Value followed by weird whitespace
+    try expectMatch("{\"load\": 99 \t, \"x\": 1}", "load", "99", true);
+}
+
+test "Scanner: Data Plucking (extractValue)" {
+    // Pluck basic strings
+    try expectPluck("{\"msg\": \"hello\"}", "msg", "hello");
+    try expectPluck("{\"msg\": \"hello world\", \"id\": 1}", "msg", "hello world");
+    
+    // Pluck primitives
+    try expectPluck("{\"load\": 99.5, \"id\": 1}", "load", "99.5");
+    try expectPluck("{\"active\": true, \"id\": 1}", "active", "true");
+    try expectPluck("{\"user\": null}", "user", "null");
+
+    // Pluck with weird spacing/boundaries
+    try expectPluck("{\"load\": 99}", "load", "99");
+    try expectPluck("{\"load\": 99\n}", "load", "99");
+
+    // Pluck with escaped quotes inside the string
+    try expectPluck("{\"msg\": \"he \\\"said\\\" hi\"}", "msg", "he \\\"said\\\" hi");
+    
+    // Missing keys
+    try expectPluck("{\"level\": \"info\"}", "msg", null);
 }
