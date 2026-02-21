@@ -1,7 +1,6 @@
 const std = @import("std");
 const Scanner = @import("scanner.zig");
 
-// Define our raw CLI structures
 pub const Condition = struct {
     key: []const u8,
     val: []const u8,
@@ -22,24 +21,24 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Fix: Omit the capture entirely as required by Zig when not used
     const config = parseArgs(allocator) catch {
         std.debug.print("Usage: zog [--file <path>] --key <key> --val <val> [--or ...] [--pluck <key>]\n", .{});
         std.process.exit(1);
     };
 
     const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
+    
+    // Increase buffer size to 128KB to reduce syscall overhead
+    var bw = std.io.BufferedWriter(128 * 1024, @TypeOf(stdout_file)){ .unbuffered_writer = stdout_file };
     const stdout = bw.writer();
 
-    // Route to searchFile for high-speed macOS hints, or searchStream for pipes
     if (config.file_path) |path| {
         try Scanner.searchFile(allocator, path, config.groups, config.pluck, stdout);
     } else {
+        // Now uses the same high-speed producer-consumer engine as file search
         try Scanner.searchStream(allocator, config.groups, config.pluck, stdout);
     }
 
-    // Flush to ensure all results are written before the program exits
     try bw.flush();
 }
 
@@ -72,7 +71,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             , .{});
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            std.debug.print("zog v0.1.1\n", .{});
+            std.debug.print("zog v0.1.2\n", .{});
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--file")) {
             config.file_path = try allocator.dupe(u8, args.next() orelse return error.MissingFileValue);
@@ -83,22 +82,16 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             if (current_key) |k| {
                 try current_conditions.append(.{ .key = k, .val = val });
                 current_key = null;
-            } else {
-                return error.ValWithoutKey;
-            }
+            } else return error.ValWithoutKey;
         } else if (std.mem.eql(u8, arg, "--or")) {
             if (current_conditions.items.len == 0) return error.EmptyOrGroup;
-            // Save the current AND group and start a new one
             try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
             current_conditions = std.ArrayList(Condition).init(allocator);
         } else if (std.mem.eql(u8, arg, "--pluck")) {
             config.pluck = try allocator.dupe(u8, args.next() orelse return error.MissingPluckValue);
-        } else {
-            return error.InvalidArgument;
-        }
+        } else return error.InvalidArgument;
     }
 
-    // Append the final group
     if (current_conditions.items.len > 0) {
         try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
     }
