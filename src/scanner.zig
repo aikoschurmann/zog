@@ -13,17 +13,34 @@ const CompiledCondition = struct {
     val_quoted: []const u8,
     val_unquoted: []const u8,
     val_f64: ?f64,
+    val_i64: ?i64,
     op: main.Operator,
     type_forced: TypeForced,
 };
 
 const CompiledGroup = struct { conditions: []CompiledCondition };
 
+const CompiledPluck = struct {
+    key_quoted: []const u8,
+    ptype: main.PluckType,
+    original_str: []const u8,
+};
+
 const CompiledPlan = struct {
     groups: []CompiledGroup,
-    pluck_keys: [][]const u8,
+    pluck: []CompiledPluck,
     unique_first_chars: []u8,
     char_vectors: []V, 
+    has_aggregations: bool,
+    format: main.OutputFormat,
+};
+
+const AggState = union(enum) {
+    raw: void,
+    count: usize,
+    sum: f64,
+    min: f64,
+    max: f64,
 };
 
 const Buffer = struct { 
@@ -40,18 +57,44 @@ const ReaderCtx = struct {
     read_sem: *std.Thread.Semaphore,
 };
 
-fn isPrimitive(val: []const u8) bool {
-    if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "false") or std.mem.eql(u8, val, "null")) return true;
-    _ = std.fmt.parseFloat(f64, val) catch return false;
-    return true;
+inline fn isFastPrimitive(val: []const u8) bool {
+    if (val.len == 0) return false;
+    const c = val[0];
+    // If it starts with a number, minus, 't' (true), 'f' (false), or 'n' (null), it's primitive.
+    return (c >= '0' and c <= '9') or c == '-' or c == 't' or c == 'f' or c == 'n';
 }
 
-fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup, pluck: [][]const u8) !CompiledPlan {
-    var comp_groups = try allocator.alloc(CompiledGroup, groups.len);
+inline fn isPrimitiveTerminator(c: u8) bool {
+    return switch (c) {
+        ',', '}', ']', ' ', '\t', '\r', '\n' => true,
+        else => false,
+    };
+}
+
+inline fn parseFastInt(s: []const u8) ?i64 {
+    if (s.len == 0) return null;
+    var sign: i64 = 1;
+    var i: usize = 0;
+    if (s[0] == '-') {
+        sign = -1;
+        i += 1;
+    }
+    if (i == s.len) return null;
+    var res: i64 = 0;
+    while (i < s.len) : (i += 1) {
+        const digit = s[i] -% '0';
+        if (digit > 9) return null;
+        res = res * 10 + @as(i64, digit);
+    }
+    return res * sign;
+}
+
+fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan {
+    var comp_groups = try allocator.alloc(CompiledGroup, config.groups.len);
     var unique_list = std.ArrayList(u8).init(allocator);
     var seen_chars = [_]bool{false} ** 256;
 
-    for (groups, 0..) |g, i| {
+    for (config.groups, 0..) |g, i| {
         var comp_conds = try allocator.alloc(CompiledCondition, g.conditions.len);
         for (g.conditions, 0..) |c, j| {
             const key_q = try std.fmt.allocPrint(allocator, "\"{s}\"", .{c.key});
@@ -59,14 +102,16 @@ fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup
 
             var actual_val = c.val;
             var type_forced: TypeForced = .none;
-            if (std.mem.startsWith(u8, actual_val, "s:")) { actual_val = actual_val[2..]; type_forced = .string; }
-            else if (std.mem.startsWith(u8, actual_val, "n:") or std.mem.startsWith(u8, actual_val, "b:")) { actual_val = actual_val[2..]; type_forced = .numeric; }
+            if (std.mem.startsWith(u8, actual_val, "s:")) { actual_val = actual_val[2..]; type_forced = .string;
+            } else if (std.mem.startsWith(u8, actual_val, "n:") or std.mem.startsWith(u8, actual_val, "b:")) { actual_val = actual_val[2..];
+            type_forced = .numeric; }
 
             comp_conds[j] = .{
                 .key_quoted = key_q,
                 .val_quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{actual_val}),
                 .val_unquoted = try allocator.dupe(u8, actual_val),
                 .val_f64 = std.fmt.parseFloat(f64, actual_val) catch null,
+                .val_i64 = std.fmt.parseInt(i64, actual_val, 10) catch null,
                 .op = c.op,
                 .type_forced = type_forced,
             };
@@ -78,54 +123,75 @@ fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup
     var cvs = try allocator.alloc(V, ufc.len);
     for (ufc, 0..) |char, i| cvs[i] = @splat(char);
 
-    var pks = try allocator.alloc([]const u8, pluck.len);
-    for (pluck, 0..) |p, i| pks[i] = try std.fmt.allocPrint(allocator, "\"{s}\"", .{p});
+    var pks = try allocator.alloc(CompiledPluck, config.pluck.len);
+    var has_aggs = false;
+    for (config.pluck, 0..) |p, i| {
+        pks[i] = .{
+            .key_quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{p.key}),
+            .ptype = p.ptype,
+            .original_str = p.original_str,
+        };
+        if (p.ptype != .raw) has_aggs = true;
+    }
 
-    return CompiledPlan{ .groups = comp_groups, .pluck_keys = pks, .unique_first_chars = ufc, .char_vectors = cvs };
+    return CompiledPlan{ 
+        .groups = comp_groups, 
+        .pluck = pks, 
+        .unique_first_chars = ufc, 
+        .char_vectors = cvs,
+        .has_aggregations = has_aggs,
+        .format = config.format,
+    };
 }
-
-// Replace the evaluateValue function in src/scanner.zig with this:
 
 inline fn evaluateValue(rest_si: []const u8, cond: CompiledCondition) bool {
     const is_json_string = rest_si.len > 0 and rest_si[0] == '"';
 
     if (cond.op == .eq or cond.op == .neq) {
         var is_match = false;
-        
-        // Optimized EQ: Check the most likely type first based on the query
         if (is_json_string) {
-            // JSON is a string: only check if we aren't forced to numeric
             if (cond.type_forced != .numeric) {
                 if (std.mem.startsWith(u8, rest_si, cond.val_quoted)) is_match = true;
             }
         } else {
-            // JSON is a primitive: only check if we aren't forced to string
             if (cond.type_forced != .string) {
                 if (std.mem.startsWith(u8, rest_si, cond.val_unquoted)) {
                     const me = cond.val_unquoted.len;
-                    if (me == rest_si.len or std.mem.indexOfScalar(u8, ",}] \t\r\n", rest_si[me]) != null) is_match = true;
+                    if (me == rest_si.len or isPrimitiveTerminator(rest_si[me])) is_match = true;
                 }
             }
         }
         return if (cond.op == .eq) is_match else !is_match;
     } 
 
-    // HAS and Math remain unchanged as they already isolate the value
     if (cond.op == .has) {
-        if (extractValueFromRest(rest_si)) |extracted| return std.mem.indexOf(u8, extracted, cond.val_unquoted) != null;
+        if (extractValueFromRest(rest_si)) |extracted|
+            return std.mem.indexOf(u8, extracted, cond.val_unquoted) != null;
         return false;
     }
 
-    if (cond.val_f64) |target| {
+    if (cond.val_f64) |target_f64| {
         if (cond.type_forced == .string and !is_json_string) return false;
         if (cond.type_forced == .numeric and is_json_string) return false;
+        
         if (extractValueFromRest(rest_si)) |extracted| {
-            if (std.fmt.parseFloat(f64, extracted)) |parsed| {
+            if (cond.val_i64) |target_i64| {
+                if (parseFastInt(extracted)) |parsed_i64| {
+                    return switch (cond.op) { 
+                        .gt => parsed_i64 > target_i64, 
+                        .lt => parsed_i64 < target_i64, 
+                        .gte => parsed_i64 >= target_i64, 
+                        .lte => parsed_i64 <= target_i64, 
+                        else => false 
+                    };
+                }
+            }
+            if (std.fmt.parseFloat(f64, extracted)) |parsed_f64| {
                 return switch (cond.op) { 
-                    .gt => parsed > target, 
-                    .lt => parsed < target, 
-                    .gte => parsed >= target, 
-                    .lte => parsed <= target, 
+                    .gt => parsed_f64 > target_f64, 
+                    .lt => parsed_f64 < target_f64, 
+                    .gte => parsed_f64 >= target_f64, 
+                    .lte => parsed_f64 <= target_f64, 
                     else => false 
                 };
             } else |_| {}
@@ -225,36 +291,257 @@ inline fn extractValueFromRest(vs: []const u8) ?[]const u8 {
     if (vs.len == 0) return null;
     if (vs[0] == '"') {
         var i: usize = 1;
-        while (i < vs.len) : (i += 1) {
-            if (vs[i] == '"') {
+        while (i < vs.len) {
+            if (std.mem.indexOfScalar(u8, vs[i..], '"')) |next_idx| {
+                i += next_idx;
                 var bc: usize = 0;
                 var j = i;
                 while (j > 1) { j -= 1; if (vs[j] == '\\') bc += 1 else break; }
                 if (bc % 2 == 0) return vs[1..i];
+                i += 1;
+            } else {
+                break;
             }
         }
     } else if (std.mem.indexOfAny(u8, vs, ",}] \t\r\n")) |ei| return vs[0..ei];
     return vs;
 }
 
-fn extractValue(line: []const u8, pk_quoted: []const u8) ?[]const u8 {
+inline fn extractValueSingle(line: []const u8, pk_quoted: []const u8) ?[]const u8 {
     var search = line;
     while (std.mem.indexOf(u8, search, pk_quoted)) |kp| {
         const rest = search[kp + pk_quoted.len..];
-        if (std.mem.indexOfNone(u8, rest, " \t:")) |si| { if (extractValueFromRest(rest[si..])) |val| return val; }
+        if (std.mem.indexOfNone(u8, rest, " \t:")) |si| { 
+            if (extractValueFromRest(rest[si..])) |val| return val; 
+        }
         search = rest;
     }
     return null;
 }
 
-fn handleMatch(line: []const u8, pluck_keys: [][]const u8, writer: anytype) !void {
-    if (pluck_keys.len > 0) {
-        for (pluck_keys, 0..) |pk, i| {
-            if (extractValue(line, pk)) |val| try writer.print("{s}", .{val});
-            if (i < pluck_keys.len - 1) try writer.print("\t", .{});
+
+
+fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, format: main.OutputFormat, writer: anytype) !void {
+    // 8KB Stack buffer to build the line without function call overhead
+    var buf: [8192]u8 = undefined;
+    var cursor: usize = 0;
+
+    // Helper to safely write bytes to the scratch buffer
+    const Flush = struct {
+        inline fn check(c: *usize, req: usize, b: []u8, w: anytype) !void {
+            if (c.* + req > b.len) {
+                try w.writeAll(b[0..c.*]);
+                c.* = 0;
+            }
+        }
+        inline fn append(c: *usize, b: []u8, val: []const u8, w: anytype) !void {
+            if (val.len >= b.len) {
+                try w.writeAll(b[0..c.*]);
+                c.* = 0;
+                try w.writeAll(val);
+            } else {
+                try check(c, val.len, b, w);
+                @memcpy(b[c.* .. c.* + val.len], val);
+                c.* += val.len;
+            }
+        }
+    };
+
+    if (format == .json) {
+        buf[cursor] = '{'; cursor += 1;
+        var first = true;
+        for (results, 0..) |res, i| {
+            if (res) |val| {
+                if (!first) {
+                    try Flush.check(&cursor, 2, &buf, writer);
+                    buf[cursor] = ','; buf[cursor+1] = ' '; cursor += 2;
+                }
+                first = false;
+                
+                try Flush.check(&cursor, 1, &buf, writer);
+                buf[cursor] = '"'; cursor += 1;
+                
+                const key = plucks[i].original_str;
+                try Flush.append(&cursor, &buf, key, writer);
+                
+                try Flush.check(&cursor, 3, &buf, writer);
+                buf[cursor] = '"'; buf[cursor+1] = ':'; buf[cursor+2] = ' '; cursor += 3;
+                
+                if (isFastPrimitive(val)) {
+                    try Flush.append(&cursor, &buf, val, writer);
+                } else {
+                    try Flush.check(&cursor, 1, &buf, writer);
+                    buf[cursor] = '"'; cursor += 1;
+                    
+                    try Flush.append(&cursor, &buf, val, writer);
+                    
+                    try Flush.check(&cursor, 1, &buf, writer);
+                    buf[cursor] = '"'; cursor += 1;
+                }
+            }
+        }
+        try Flush.check(&cursor, 2, &buf, writer);
+        buf[cursor] = '}'; buf[cursor+1] = '\n'; cursor += 2;
+        try writer.writeAll(buf[0..cursor]);
+        
+    } else if (format == .csv) {
+        for (results, 0..) |res, i| {
+            if (res) |val| {
+                try Flush.check(&cursor, 1, &buf, writer);
+                buf[cursor] = '"'; cursor += 1;
+                
+                try Flush.append(&cursor, &buf, val, writer);
+                
+                try Flush.check(&cursor, 1, &buf, writer);
+                buf[cursor] = '"'; cursor += 1;
+            }
+            if (i < results.len - 1) {
+                try Flush.check(&cursor, 1, &buf, writer);
+                buf[cursor] = ','; cursor += 1;
+            }
+        }
+        try Flush.check(&cursor, 1, &buf, writer);
+        buf[cursor] = '\n'; cursor += 1;
+        try writer.writeAll(buf[0..cursor]);
+        
+    } else {
+        for (results, 0..) |res, i| {
+            if (res) |val| {
+                try Flush.append(&cursor, &buf, val, writer);
+            }
+            if (i < results.len - 1) {
+                try Flush.check(&cursor, 1, &buf, writer);
+                buf[cursor] = '\t'; cursor += 1;
+            }
+        }
+        try Flush.check(&cursor, 1, &buf, writer);
+        buf[cursor] = '\n'; cursor += 1;
+        try writer.writeAll(buf[0..cursor]);
+    }
+}
+
+fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck, format: main.OutputFormat, writer: anytype) !void {
+    if (format == .json) {
+        try writer.print("{{", .{});
+        for (agg_states, 0..) |state, i| {
+            if (i > 0) try writer.print(", ", .{});
+            try writer.print("\"{s}\": ", .{plucks[i].original_str});
+            switch (state) {
+                .raw => try writer.print("null", .{}),
+                .count => |c| try writer.print("{d}", .{c}),
+                .sum => |s| try writer.print("{d:.4}", .{s}),
+                .min => |m| if (m == std.math.inf(f64)) try writer.print("null", .{}) else try writer.print("{d:.4}", .{m}),
+                .max => |m| if (m == -std.math.inf(f64)) try writer.print("null", .{}) else try writer.print("{d:.4}", .{m}),
+            }
+        }
+        try writer.print("}}\n", .{});
+    } else if (format == .csv) {
+        for (agg_states, 0..) |state, i| {
+            switch (state) {
+                .raw => {},
+                .count => |c| try writer.print("{d}", .{c}),
+                .sum => |s| try writer.print("{d:.4}", .{s}),
+                .min => |m| if (m == std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
+                .max => |m| if (m == -std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
+            }
+            if (i < agg_states.len - 1) try writer.print(",", .{});
         }
         try writer.print("\n", .{});
-    } else try writer.print("{s}\n", .{line});
+    } else {
+        for (agg_states, 0..) |state, i| {
+            switch (state) {
+                .raw => {},
+                .count => |c| try writer.print("{d}", .{c}),
+                .sum => |s| try writer.print("{d:.4}", .{s}),
+                .min => |m| if (m == std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
+                .max => |m| if (m == -std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
+            }
+            if (i < agg_states.len - 1) try writer.print("\t", .{});
+        }
+        try writer.print("\n", .{});
+    }
+}
+
+fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, writer: anytype) !void {
+    const pluck_keys = plan.pluck;
+    if (pluck_keys.len == 0) {
+        try writer.print("{s}\n", .{line});
+        return;
+    }
+
+    var results: [256]?[]const u8 = .{null} ** 256;
+    const max_keys = @min(pluck_keys.len, 256);
+    
+    if (pluck_keys.len == 1) {
+        if (extractValueSingle(line, pluck_keys[0].key_quoted)) |val| {
+            results[0] = val;
+        }
+    } else {
+        var found_count: usize = 0;
+        var search = line;
+        while (search.len > 0 and found_count < max_keys) {
+            const quote_idx = std.mem.indexOfScalar(u8, search, '"') orelse break;
+            search = search[quote_idx..]; 
+            
+            const end_quote_idx = std.mem.indexOfScalar(u8, search[1..], '"');
+            if (end_quote_idx == null) break;
+            
+            const full_key = search[0 .. end_quote_idx.? + 2];
+            search = search[end_quote_idx.? + 2 ..];
+            
+            // 1. Check if this key matches ANY field we want to extract
+            var wants_key = false;
+            for (pluck_keys[0..max_keys], 0..) |pk, i| {
+                if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
+                    wants_key = true;
+                    break;
+                }
+            }
+            
+            if (wants_key) {
+                if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos| {
+                    if (search[colon_pos] == ':') {
+                        const rest = search[colon_pos + 1 ..];
+                        if (std.mem.indexOfNone(u8, rest, " \t")) |val_start| {
+                            if (extractValueFromRest(rest[val_start..])) |val| {
+                                
+                                // 2. Assign the value to ALL aggregations targeting this key
+                                for (pluck_keys[0..max_keys], 0..) |pk, i| {
+                                    if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
+                                        results[i] = val;
+                                        found_count += 1;
+                                    }
+                                }
+                                
+                                if (rest[val_start] == '"') {
+                                    search = rest[val_start + val.len + 2 ..]; 
+                                } else {
+                                    search = rest[val_start + val.len ..];
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (plan.has_aggregations) {
+        for (0..max_keys) |i| {
+            if (results[i]) |val| {
+                switch (pluck_keys[i].ptype) {
+                    .raw => {},
+                    .count => agg_states[i].count += 1,
+                    .sum => { if (std.fmt.parseFloat(f64, val)) |f| agg_states[i].sum += f else |_| {} },
+                    .min => { if (std.fmt.parseFloat(f64, val)) |f| agg_states[i].min = @min(agg_states[i].min, f) else |_| {} },
+                    .max => { if (std.fmt.parseFloat(f64, val)) |f| agg_states[i].max = @max(agg_states[i].max, f) else |_| {} },
+                }
+            }
+        }
+    } else {
+        try printFormatted(results[0..max_keys], pluck_keys[0..max_keys], plan.format, writer);
+    }
 }
 
 fn readerThread(ctx: *ReaderCtx) void {
@@ -280,20 +567,31 @@ fn readerThread(ctx: *ReaderCtx) void {
     }
 }
 
-pub fn searchFile(allocator: std.mem.Allocator, path: []const u8, groups: []const main.ConditionGroup, pluck: [][]const u8, writer: anytype) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
+pub fn searchFile(allocator: std.mem.Allocator, config: main.Config, writer: anytype) !void {
+    const file = try std.fs.cwd().openFile(config.file_path.?, .{});
     defer file.close();
-    try searchFileInternal(allocator, file, groups, pluck, writer);
+    try searchFileInternal(allocator, file, config, writer);
 }
 
-pub fn searchStream(allocator: std.mem.Allocator, groups: []const main.ConditionGroup, pluck: [][]const u8, writer: anytype) !void {
-    try searchFileInternal(allocator, std.io.getStdIn(), groups, pluck, writer);
+pub fn searchStream(allocator: std.mem.Allocator, config: main.Config, writer: anytype) !void {
+    try searchFileInternal(allocator, std.io.getStdIn(), config, writer);
 }
 
-fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: []const main.ConditionGroup, pluck: [][]const u8, writer: anytype) !void {
+fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: main.Config, writer: anytype) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const plan = try compilePlan(arena.allocator(), groups, pluck);
+    const plan = try compilePlan(arena.allocator(), config);
+
+    var agg_states = try arena.allocator().alloc(AggState, plan.pluck.len);
+    for (plan.pluck, 0..) |p, i| {
+        agg_states[i] = switch (p.ptype) {
+            .raw => .raw,
+            .count => .{ .count = 0 },
+            .sum => .{ .sum = 0.0 },
+            .min => .{ .min = std.math.inf(f64) },
+            .max => .{ .max = -std.math.inf(f64) },
+        };
+    }
 
     var fill_sem = std.Thread.Semaphore{ .permits = 0 };
     var read_sem = std.Thread.Semaphore{ .permits = 2 };
@@ -322,7 +620,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: [
                 while (iter != 0) {
                     const nl_pos = @ctz(iter);
                     const line = data[sol .. i + nl_pos];
-                    if (evaluatePlan(line, plan)) try handleMatch(line, plan.pluck_keys, writer);
+                    if (evaluatePlan(line, plan)) try handleMatch(line, plan, agg_states, writer);
                     sol = i + nl_pos + 1;
                     iter &= iter - 1;
                 }
@@ -331,13 +629,13 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: [
         while (sol < data.len) {
             if (std.mem.indexOfScalar(u8, data[sol..], '\n')) |nl_pos| {
                 const line = data[sol .. sol + nl_pos];
-                if (evaluatePlan(line, plan)) try handleMatch(line, plan.pluck_keys, writer);
+                if (evaluatePlan(line, plan)) try handleMatch(line, plan, agg_states, writer);
                 sol += nl_pos + 1;
             } else break;
         }
         if (ctx.done.load(.acquire) and sol < data.len) {
             const line = std.mem.trimRight(u8, data[sol..], "\r\n");
-            if (line.len > 0 and evaluatePlan(line, plan)) try handleMatch(line, plan.pluck_keys, writer);
+            if (line.len > 0 and evaluatePlan(line, plan)) try handleMatch(line, plan, agg_states, writer);
             sol = data.len;
         }
         consume_idx = 1 - consume_idx;
@@ -345,4 +643,8 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: [
         if (ctx.done.load(.acquire) and fill_sem.permits == 0) break;
     }
     thread.join();
+
+    if (plan.has_aggregations) {
+        try printAggregations(agg_states, plan.pluck, plan.format, writer);
+    }
 }
