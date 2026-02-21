@@ -260,6 +260,17 @@ pub fn searchFile(allocator: std.mem.Allocator, file_path: []const u8, groups: [
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
+    const builtin = @import("builtin");
+    
+    // OS-specific kernel hints to bypass the page cache
+    if (builtin.os.tag == .macos or builtin.os.tag == .ios) {
+        const F_NOCACHE: i32 = 48;
+        _ = std.posix.system.fcntl(file.handle, F_NOCACHE, @as(i32, 1));
+    } else if (builtin.os.tag == .linux) {
+        // POSIX_FADV_SEQUENTIAL (2) to double read-ahead, and POSIX_FADV_DONTNEED (4)
+        _ = std.posix.system.posix_fadvise(file.handle, 0, 0, 2); 
+    }
+    
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const plan = try compilePlan(arena.allocator(), groups, pluck);

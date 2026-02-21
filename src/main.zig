@@ -54,7 +54,27 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var current_key: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--file")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print(
+                \\zog - Blisteringly fast JSONL search engine
+                \\
+                \\Usage: zog [--file <path>] --key <key> --val <val> [--or ...] [--pluck <key>]
+                \\
+                \\Options:
+                \\  --file <path>   File to search (if omitted, reads from stdin)
+                \\  --key <key>     JSON key to search for
+                \\  --val <val>     Value to match (auto-detects numbers/booleans)
+                \\  --or            Logical OR separator for multiple conditions
+                \\  --pluck <key>   Extract and print only this key's value
+                \\  --help, -h      Show this help message
+                \\  --version, -v   Show version
+                \\
+            , .{});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            std.debug.print("zog v0.1.1\n", .{});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--file")) {
             config.file_path = try allocator.dupe(u8, args.next() orelse return error.MissingFileValue);
         } else if (std.mem.eql(u8, arg, "--key")) {
             current_key = try allocator.dupe(u8, args.next() orelse return error.MissingKeyValue);
