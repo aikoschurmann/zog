@@ -142,16 +142,26 @@ Instead of checking every byte one by one, `zog` loads 32-byte chunks of your lo
 
 `zog` never allocates memory on the heap during the scan. It searches the raw bytes for `"key":"value"` patterns, intelligently skips whitespace and colons, validates primitive boundaries, counts backslashes to respect JSON escaping rules, and extracts your data strictly in-place.
 
-### ⚠️ The Trade-off: False Positives
+---
 
-Because `zog` processes raw bytes instead of building an AST state machine, it does not track object nesting depth.
+## ⚠️ Limitations & Trade-offs: The "Blind Scanner"
 
-This means it can theoretically hit perfectly formatted false positives. For example, if you search for `--key level --val error` in the following log:
+zog achieves its performance by treating JSON as a literal sequence of UTF-8 bytes rather than a hierarchical data structure. To maintain speeds of 1.4+ GB/s, zog makes the following architectural trade-offs:
 
-```json
-{"event": "req", "payload": "{\"level\": \"error\"}", "level": "info"}
-```
+1. **Structural Ignorance (Nesting)**
+   - zog does not track object nesting or balance braces, so it cannot distinguish between a "root" key and a key located inside a nested sub-object.
+   - **False Positive Example**: Searching for `--key id --val 10` will match a line even if `id: 10` is buried deep within a metadata sub-object or an array.
 
-`zog` will return this line because the exact byte sequence `"level": "error"` exists inside the `payload` string.
+2. **Strict Numeric Matching (90 vs 90.0)**
+   - zog identifies numbers as raw byte sequences rather than logical values and does not perform numeric normalization.
+   - **Literalness**: Searching for `--val 90` will not match `90.0`.
+   - **Boundary Integrity**: The scanner ensures that a number match is followed by a valid JSON boundary (e.g., `,`, `}`, `]`, or whitespace). For example, searching for `99` correctly ignores `995`.
+
+3. **Whitespace & Multi-line JSON**
+   - zog is strictly designed for single-line JSONL to maintain its SIMD "fast path."
+
+4. **UTF-8 & Encoding**
+   - **Literal Keys**: zog matches the exact bytes of your search key. If your JSON uses Unicode escape sequences in keys (e.g., `"le\u0076el"`), the literal match will fail.
+   - **Encoding**: zog is a UTF-8 (u8) scanner and does not support multi-byte encodings like UTF-16 or UTF-32.
 
 For incident response, DevOps telemetry, and massive log filtering, this is standard behavior (standard `grep` does the same thing). For most users, accepting this structural edge-case is well worth the **30x speedup** over full JSON parsers.
