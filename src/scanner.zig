@@ -319,9 +319,6 @@ pub fn searchFile(allocator: std.mem.Allocator, path: []const u8, groups: []cons
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    if (builtin.os.tag == .macos) _ = std.posix.system.fcntl(file.handle, 48, @as(i32, 1));
-    if (builtin.os.tag == .linux) _ = std.posix.system.posix_fadvise(file.handle, 0, 0, 2);
-    
     try searchFileInternal(allocator, file, groups, pluck, writer);
 }
 
