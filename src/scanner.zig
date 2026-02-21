@@ -62,8 +62,7 @@ fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup
         var comp_conds = try allocator.alloc(CompiledCondition, g.conditions.len);
         for (g.conditions, 0..) |c, j| {
             const key_quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{c.key});
-            
-            // Collect the character AFTER the opening quote for the prefix path
+
             if (!seen_chars[key_quoted[1]]) {
                 seen_chars[key_quoted[1]] = true;
                 try unique_list.append(key_quoted[1]);
@@ -75,6 +74,7 @@ fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup
                 try std.fmt.allocPrint(allocator, "{s}", .{c.val})
             else
                 try std.fmt.allocPrint(allocator, "\"{s}\"", .{c.val});
+
             comp_conds[j] = .{ .key_quoted = key_quoted, .val_quoted = val_quoted };
         }
         comp_groups[i] = .{ .conditions = comp_conds };
@@ -101,32 +101,47 @@ fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup
 
 inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
     if (line.len < 2) return false;
-    var i: usize = 0;
     var might_match = false;
     const quote_vec: V = @splat('"');
 
-    // Refined Fast Path: Check for sequence of '"' followed by the unique key char
-    while (i + VECTOR_LEN + 1 <= line.len) {
-        const chunk: V = line[i..][0..VECTOR_LEN].*;
-        const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
-        
-        // Bitcast boolean vectors to masks to enable bitwise AND sequence checking
-        const quote_mask = @as(u32, @bitCast(chunk == quote_vec));
+    if (line.len >= VECTOR_LEN + 1) {
+        var i: usize = 0;
+        // Primary Fast Path
+        while (i + VECTOR_LEN + 1 <= line.len) {
+            const chunk: V = line[i..][0..VECTOR_LEN].*;
+            const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
+            
+            const quote_mask = @as(u32, @bitCast(chunk == quote_vec));
+            for (plan.char_vectors) |cv| {
+                const char_mask = @as(u32, @bitCast(next_chunk == cv));
+                if (quote_mask & char_mask != 0) {
+                    might_match = true;
+                    break;
+                }
+            }
+            if (might_match) break;
+            i += VECTOR_LEN;
+        }
 
-        for (plan.char_vectors) |cv| {
-            const char_mask = @as(u32, @bitCast(next_chunk == cv));
-            if (quote_mask & char_mask != 0) {
-                might_match = true;
-                break;
+        // SIMD Overlapping Tail Check 
+        if (!might_match and i < line.len) {
+            const tail_i = line.len - VECTOR_LEN - 1;
+            const chunk: V = line[tail_i..][0..VECTOR_LEN].*;
+            const next_chunk: V = line[tail_i + 1..][0..VECTOR_LEN].*;
+            
+            const quote_mask = @as(u32, @bitCast(chunk == quote_vec));
+            for (plan.char_vectors) |cv| {
+                const char_mask = @as(u32, @bitCast(next_chunk == cv));
+                if (quote_mask & char_mask != 0) {
+                    might_match = true;
+                    break;
+                }
             }
         }
-        if (might_match) break;
-        i += VECTOR_LEN;
-    }
-
-    if (!might_match) {
+    } else {
+        // ONLY execute scalar scan for lines that are too short to fit in SIMD (< 33 bytes)
         for (plan.unique_first_chars) |char| {
-            if (std.mem.indexOfScalar(u8, line[i..], char) != null) {
+            if (std.mem.indexOfScalar(u8, line, char) != null) {
                 might_match = true;
                 break;
             }
@@ -148,25 +163,48 @@ inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
     return false;
 }
 
+// Inlined SIMD processing block to guarantee optimization and reuse on the tail
+inline fn checkSimdChunk(line: []const u8, key_quoted: []const u8, val_quoted: []const u8, quote_vec: V, first_char_vec: V, i: usize) bool {
+    const chunk: V = line[i..][0..VECTOR_LEN].*;
+    const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
+    
+    const matches_mask = @as(u32, @bitCast(chunk == quote_vec)) & @as(u32, @bitCast(next_chunk == first_char_vec));
+
+    if (matches_mask != 0) {
+        var mask = matches_mask;
+        while (mask != 0) {
+            const bit_pos = @ctz(mask);
+            const pos = i + bit_pos;
+
+            if (std.mem.startsWith(u8, line[pos..], key_quoted)) {
+                const rest = line[pos + key_quoted.len..];
+                if (std.mem.indexOfNone(u8, rest, " \t:")) |si| {
+                    if (std.mem.startsWith(u8, rest[si..], val_quoted)) {
+                        const me = si + val_quoted.len;
+                        if (val_quoted[val_quoted.len - 1] == '"') return true;
+                        if (me < rest.len) {
+                            const next_c = rest[me];
+                            if (std.mem.indexOfScalar(u8, ",}] \t\r\n", next_c) != null) return true;
+                        } else return true;
+                    }
+                }
+            }
+            mask &= mask - 1;
+        }
+    }
+    return false;
+}
+
 fn lineMatches(line: []const u8, key_quoted: []const u8, val_quoted: []const u8) bool {
     if (line.len < 2) return false;
-    const quote_vec: V = @splat('"');
-    const first_char_vec: V = @splat(key_quoted[1]); // Match quote + first char
-    var i: usize = 0;
-    while (i + VECTOR_LEN + 1 <= line.len) {
-        const chunk: V = line[i..][0..VECTOR_LEN].*;
-        const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
-        
-        // Sequence check: chunk has quote, next chunk has key character at same SIMD index
-        const matches_mask = @as(u32, @bitCast(chunk == quote_vec)) & @as(u32, @bitCast(next_chunk == first_char_vec));
-
-        if (matches_mask != 0) {
-            var mask = matches_mask;
-            while (mask != 0) {
-                const bit_pos = @ctz(mask);
-                const pos = i + bit_pos;
-                if (std.mem.startsWith(u8, line[pos..], key_quoted)) {
-                    const rest = line[pos + key_quoted.len..];
+    
+    // Tight inline scalar fallback strictly for lines too short for SIMD (< 33 bytes)
+    if (line.len < VECTOR_LEN + 1) {
+        var j: usize = 0;
+        while (j + key_quoted.len <= line.len) : (j += 1) {
+            if (line[j] == '"' and line[j+1] == key_quoted[1]) {
+                if (std.mem.startsWith(u8, line[j..], key_quoted)) {
+                    const rest = line[j + key_quoted.len..];
                     if (std.mem.indexOfNone(u8, rest, " \t:")) |si| {
                         if (std.mem.startsWith(u8, rest[si..], val_quoted)) {
                             const me = si + val_quoted.len;
@@ -178,11 +216,27 @@ fn lineMatches(line: []const u8, key_quoted: []const u8, val_quoted: []const u8)
                         }
                     }
                 }
-                mask &= mask - 1;
             }
         }
+        return false;
+    }
+
+    const quote_vec: V = @splat('"');
+    const first_char_vec: V = @splat(key_quoted[1]);
+    var i: usize = 0;
+    
+    // Primary Fast Path
+    while (i + VECTOR_LEN + 1 <= line.len) {
+        if (checkSimdChunk(line, key_quoted, val_quoted, quote_vec, first_char_vec, i)) return true;
         i += VECTOR_LEN;
     }
+
+    // High-Performance Overlapping SIMD Tail Check
+    if (i < line.len) {
+        const tail_i = line.len - VECTOR_LEN - 1;
+        if (checkSimdChunk(line, key_quoted, val_quoted, quote_vec, first_char_vec, tail_i)) return true;
+    }
+
     return false;
 }
 
@@ -207,11 +261,12 @@ fn extractValue(line: []const u8, pk_quoted: []const u8) ?[]const u8 {
                 }
             }
         } else {
-            if (std.mem.indexOfAny(u8, vs, ",} \r\n")) |ei| return vs[0..ei];
+            if (std.mem.indexOfAny(u8, vs, ",}] \r\n")) |ei| return vs[0..ei];
             return vs;
         }
         search = rest;
     }
+    
     return null;
 }
 
@@ -227,7 +282,7 @@ fn handleMatch(line: []const u8, pk_quoted: ?[]const u8, writer: anytype) !void 
 
 fn readerThread(ctx: *ReaderCtx) void {
     var leftover_count: usize = 0;
-    var leftover_buf = std.heap.page_allocator.alloc(u8, 2 * 1024 * 1024) catch return;
+    var leftover_buf = std.heap.page_allocator.alloc(u8, 2 * BLOCK_SIZE) catch return;
     defer std.heap.page_allocator.free(leftover_buf);
 
     while (true) {
@@ -250,8 +305,9 @@ fn readerThread(ctx: *ReaderCtx) void {
             if (leftover_count > 0) @memcpy(leftover_buf[0..leftover_count], buf.data[boundary..total]);
             buf.len = boundary;
         } else {
-            buf.len = total;
-            leftover_count = 0;
+            leftover_count = total;
+            @memcpy(leftover_buf[0..leftover_count], buf.data[0..total]);
+            buf.len = 0; 
         }
 
         ctx.current_idx = 1 - ctx.current_idx;
@@ -271,7 +327,6 @@ pub fn searchFile(allocator: std.mem.Allocator, path: []const u8, groups: []cons
 
 pub fn searchStream(allocator: std.mem.Allocator, groups: []const main.ConditionGroup, pluck: ?[]const u8, writer: anytype) !void {
     const stdin = std.io.getStdIn();
-    // Pipes use the same high-speed double-buffering engine as files
     try searchFileInternal(allocator, stdin, groups, pluck, writer);
 }
 
@@ -295,10 +350,10 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: [
     };
     defer allocator.free(ctx.bufs[0].data);
     defer allocator.free(ctx.bufs[1].data);
-
+    
     const thread = try std.Thread.spawn(.{}, readerThread, .{&ctx});
     var consume_idx: usize = 0;
-
+    
     while (true) {
         fill_sem.wait();
         const buf = &ctx.bufs[consume_idx];
@@ -308,7 +363,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: [
         var sol: usize = 0;
         var i: usize = 0;
         const nl_vec: V = @splat('\n');
-
+        
         while (i + VECTOR_LEN <= data.len) : (i += VECTOR_LEN) {
             const mask = @as(u32, @bitCast(data[i..][0..VECTOR_LEN].* == nl_vec));
             if (mask != 0) {
@@ -332,7 +387,6 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, groups: [
         }
 
         if (ctx.done.load(.acquire) and sol < data.len) {
-            // Handle final line without trailing newline
             const line = std.mem.trimRight(u8, data[sol..], "\r\n");
             if (line.len > 0 and evaluatePlan(line, plan)) try handleMatch(line, plan.pluck_quoted, writer);
             sol = data.len;

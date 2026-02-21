@@ -19,7 +19,11 @@ const Config = struct {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+
+    // Wrap the allocator in an Arena to easily clean up the parsed AST and args
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const config = parseArgs(allocator) catch {
         std.debug.print("Usage: zog [--file <path>] --key <key> --val <val> [--or ...] [--pluck <key>]\n", .{});
@@ -32,14 +36,15 @@ pub fn main() !void {
     var bw = std.io.BufferedWriter(128 * 1024, @TypeOf(stdout_file)){ .unbuffered_writer = stdout_file };
     const stdout = bw.writer();
 
+    // FIX: Ensure the buffer flushes even if an error occurs during search
+    defer bw.flush() catch {};
+
     if (config.file_path) |path| {
         try Scanner.searchFile(allocator, path, config.groups, config.pluck, stdout);
     } else {
         // Now uses the same high-speed producer-consumer engine as file search
         try Scanner.searchStream(allocator, config.groups, config.pluck, stdout);
     }
-
-    try bw.flush();
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Config {
