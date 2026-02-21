@@ -44,10 +44,17 @@ def main():
 
     print("\n--- Running Integrity Check ---")
     
-    zog_file_cmd = f"{ZOG_BIN} --file {FILE_NAME} --key level --val error"
-    zog_pipe_cmd = f"cat {FILE_NAME} | {ZOG_BIN} --key level --val error"
-    grep_cmd = f"grep '\"level\": \"error\"' {FILE_NAME}"
-    jq_cmd = f"jq -c 'select(.level == \"error\")' {FILE_NAME}"
+    # Complex Query: (level == "error" AND message == "DB Connection timeout") OR (level == "warn" AND message == "Disk space low")
+    
+    zog_file_cmd = f"{ZOG_BIN} --file {FILE_NAME} --key level --val error --key message --val 'DB Connection timeout' --or --key level --val warn --key message --val 'Disk space low'"
+    
+    zog_pipe_cmd = f"cat {FILE_NAME} | {ZOG_BIN} --key level --val error --key message --val 'DB Connection timeout' --or --key level --val warn --key message --val 'Disk space low'"
+    
+    # Grep has to use costly .* wildcards because the message comes after the level in your JSON format
+    grep_cmd = f"grep -E '\"level\": \"error\".*\"message\": \"DB Connection timeout\"|\"level\": \"warn\".*\"message\": \"Disk space low\"' {FILE_NAME}"
+    
+    # JQ builds a heavy AST to evaluate the nested logic
+    jq_cmd = f"jq -c 'select((.level == \"error\" and .message == \"DB Connection timeout\") or (.level == \"warn\" and .message == \"Disk space low\"))' {FILE_NAME}"
 
     # Verify counts across different zog paths
     print("Counting results: Zog (mmap)...")
@@ -88,12 +95,12 @@ def main():
         "zog (mmap)": zog_file_cmd,
         "zog (pipe)": zog_pipe_cmd,
         "grep (file)": grep_cmd,
-        "grep (pipe)": f"cat {FILE_NAME} | grep '\"level\": \"error\"'",
+        "grep (pipe)": f"cat {FILE_NAME} | grep -E '\"level\": \"error\".*\"message\": \"DB Connection timeout\"|\"level\": \"warn\".*\"message\": \"Disk space low\"'",
     }
 
-    #if check_tool("jq"):
-    #    scenarios["jq (file)"] = jq_cmd
-    #    scenarios["jq (pipe)"] = f"cat {FILE_NAME} | jq -c 'select(.level == \"error\")'"
+    if check_tool("jq"):
+        scenarios["jq (file)"] = jq_cmd
+        scenarios["jq (pipe)"] = f"cat {FILE_NAME} | jq -c 'select(.level == \"error\")'"
 
     results = []
     for name, cmd in scenarios.items():

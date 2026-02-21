@@ -1,13 +1,90 @@
 const std = @import("std");
+const main = @import("main.zig");
 
-/// Checks if a JSON line contains `"key": "val"`, ignoring spaces, tabs, or colons.
+// ==========================================
+// QUERY COMPILER & EVALUATOR
+// ==========================================
+// ==========================================
+// QUERY COMPILER & EVALUATOR
+// ==========================================
+
+const CompiledCondition = struct {
+    key_quoted: []const u8,
+    val_quoted: []const u8,
+};
+
+const CompiledGroup = struct {
+    conditions: []CompiledCondition,
+};
+
+const CompiledPlan = struct {
+    groups: []CompiledGroup,
+    pluck_quoted: ?[]const u8,
+};
+
+// Helper to detect JSON primitives (numbers, booleans, null)
+fn isPrimitive(val: []const u8) bool {
+    if (std.mem.eql(u8, val, "true")) return true;
+    if (std.mem.eql(u8, val, "false")) return true;
+    if (std.mem.eql(u8, val, "null")) return true;
+    
+    // If it parses as a float, treat it as a raw number
+    _ = std.fmt.parseFloat(f64, val) catch return false;
+    return true;
+}
+
+fn compilePlan(allocator: std.mem.Allocator, groups: []const main.ConditionGroup, pluck: ?[]const u8) !CompiledPlan {
+    var comp_groups = try allocator.alloc(CompiledGroup, groups.len);
+    for (groups, 0..) |g, i| {
+        var comp_conds = try allocator.alloc(CompiledCondition, g.conditions.len);
+        for (g.conditions, 0..) |c, j| {
+            const key_quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{c.key});
+            
+            // 1. Explicitly quoted by user (e.g., '"99"') -> Leave it alone
+            // 2. Auto-detected primitive (e.g., 99 or true) -> Leave it alone
+            // 3. Normal string (e.g., critical) -> Wrap it in quotes
+            const val_quoted = if (c.val.len >= 2 and c.val[0] == '"' and c.val[c.val.len - 1] == '"')
+                try std.fmt.allocPrint(allocator, "{s}", .{c.val})
+            else if (isPrimitive(c.val))
+                try std.fmt.allocPrint(allocator, "{s}", .{c.val})
+            else
+                try std.fmt.allocPrint(allocator, "\"{s}\"", .{c.val});
+
+            comp_conds[j] = .{
+                .key_quoted = key_quoted,
+                .val_quoted = val_quoted,
+            };
+        }
+        comp_groups[i] = .{ .conditions = comp_conds };
+    }
+    var pluck_quoted: ?[]const u8 = null;
+    if (pluck) |p| pluck_quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{p});
+    return CompiledPlan{ .groups = comp_groups, .pluck_quoted = pluck_quoted };
+}
+
+inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
+    for (plan.groups) |group| {
+        var group_matched = true;
+        for (group.conditions) |cond| {
+            if (!lineMatches(line, cond.key_quoted, cond.val_quoted)) {
+                group_matched = false;
+                break;
+            }
+        }
+        if (group_matched) return true;
+    }
+    return false;
+}
+
+// ==========================================
+// SIMD SCANNER (NEON/AVX2)
+// ==========================================
 fn lineMatches(line: []const u8, key_quoted: []const u8, val_quoted: []const u8) bool {
-    const vector_len = 32; 
+    const vector_len = 32;
     const V = @Vector(vector_len, u8);
     const first_char_vec: V = @splat(key_quoted[0]);
     
     var i: usize = 0;
-    // 1. SIMD Loop
     while (i + vector_len <= line.len) {
         const chunk: V = line[i..][0..vector_len].*;
         const matches = chunk == first_char_vec;
@@ -17,58 +94,75 @@ fn lineMatches(line: []const u8, key_quoted: []const u8, val_quoted: []const u8)
             while (mask != 0) {
                 const bit_pos = @ctz(mask);
                 const pos = i + bit_pos;
-                
-                // Potential key match
                 if (std.mem.startsWith(u8, line[pos..], key_quoted)) {
                     const rest = line[pos + key_quoted.len..];
-                    // Find where the value starts (skip spaces/tabs/colons)
                     if (std.mem.indexOfNone(u8, rest, " \t:")) |start_idx| {
-                        if (std.mem.startsWith(u8, rest[start_idx..], val_quoted)) return true;
+                        
+                        // --- BOUNDARY CHECK ---
+                        if (std.mem.startsWith(u8, rest[start_idx..], val_quoted)) {
+                            const match_end = start_idx + val_quoted.len;
+                            // If it's a string (ends in quote), the exact match is perfect.
+                            if (val_quoted[val_quoted.len - 1] == '"') {
+                                return true;
+                            } 
+                            // If it's a primitive (number/bool), check the boundary char
+                            else if (match_end < rest.len) {
+                                const next_c = rest[match_end];
+                                // Valid JSON boundaries after a primitive
+                                if (next_c == ',' or next_c == '}' or next_c == ']' or next_c == ' ' or next_c == '\t' or next_c == '\r' or next_c == '\n') {
+                                    return true;
+                                }
+                            } else {
+                                // Hit the end of the line
+                                return true;
+                            }
+                        }
                     }
-                    // If this specific occurrence didn't match, DON'T return false.
-                    // Keep loop going for other occurrences in the same chunk/line.
                 }
-                mask &= mask - 1; 
+                mask &= mask - 1;
             }
         }
         i += vector_len;
     }
 
-    // 2. Tail Processing (Iterative for 100% Accuracy)
     var tail = line[i..];
     while (std.mem.indexOf(u8, tail, key_quoted)) |key_pos| {
         const rest = tail[key_pos + key_quoted.len..];
         if (std.mem.indexOfNone(u8, rest, " \t:")) |start_idx| {
-            if (std.mem.startsWith(u8, rest[start_idx..], val_quoted)) return true;
+            
+            // --- BOUNDARY CHECK (TAIL) ---
+            if (std.mem.startsWith(u8, rest[start_idx..], val_quoted)) {
+                const match_end = start_idx + val_quoted.len;
+                if (val_quoted[val_quoted.len - 1] == '"') {
+                    return true;
+                } else if (match_end < rest.len) {
+                    const next_c = rest[match_end];
+                    if (next_c == ',' or next_c == '}' or next_c == ']' or next_c == ' ' or next_c == '\t' or next_c == '\r' or next_c == '\n') {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
         }
-        tail = rest; // Advance search pointer
+        tail = rest;
     }
-
     return false;
 }
 
-/// Finds a key in a JSON line and extracts its value (string, number, or boolean) without allocating memory.
-/// This version correctly handles escaped quotes and false positive keys inside other strings.
 fn extractValue(line: []const u8, pluck_key_quoted: []const u8) ?[]const u8 {
     var search_slice = line;
-    
-    // 1. Iterative Search: Look for the key multiple times if the first match is a false positive
     while (std.mem.indexOf(u8, search_slice, pluck_key_quoted)) |key_pos| {
         const rest = search_slice[key_pos + pluck_key_quoted.len ..];
-
-        // 2. High-Performance Skip: Find where the value actually starts
         const start_idx = std.mem.indexOfNone(u8, rest, " \t:") orelse return null;
         const val_start = rest[start_idx..];
-
         if (val_start.len == 0) return null;
 
-        // 3. Handle Quoted Strings
         if (val_start[0] == '"') {
-            const content_start = 1; // skip opening quote
+            const content_start = 1;
             var i: usize = content_start;
             while (i < val_start.len) : (i += 1) {
                 if (val_start[i] == '"') {
-                    // Backslash Counting: Determine if this quote is escaped
                     var backslash_count: usize = 0;
                     var j = i;
                     while (j > content_start) {
@@ -77,34 +171,22 @@ fn extractValue(line: []const u8, pluck_key_quoted: []const u8) ?[]const u8 {
                             backslash_count += 1;
                         } else break;
                     }
-                    
-                    // If count is even (0, 2, 4...), the quote is NOT escaped.
                     if (backslash_count % 2 == 0) return val_start[content_start..i];
                 }
             }
-            // If string never closes, it might be an invalid occurrence; continue search.
         } else {
-            // 4. Handle Numbers, Booleans, or Null
             var i: usize = 0;
             while (i < val_start.len) : (i += 1) {
                 const c = val_start[i];
-                // JSON delimiters for unquoted values
-                if (c == ',' or c == '}' or c == ' ' or c == '\r' or c == '\n') {
-                    return val_start[0..i];
-                }
+                if (c == ',' or c == '}' or c == ' ' or c == '\r' or c == '\n') return val_start[0..i];
             }
-            // End of line reached
             return val_start;
         }
-        
-        // Advance search slice to look for the next occurrence of the key in this line
         search_slice = rest;
     }
-    
     return null;
 }
 
-/// Helper to handle what gets printed (the whole line, or just the plucked value)
 fn handleMatch(line: []const u8, pluck_key_quoted: ?[]const u8, writer: anytype) !void {
     if (pluck_key_quoted) |pk| {
         if (extractValue(line, pk)) |val| {
@@ -115,233 +197,202 @@ fn handleMatch(line: []const u8, pluck_key_quoted: ?[]const u8, writer: anytype)
     }
 }
 
-/// Parses a live stream (like piped stdin) line-by-line using a 64KB stack buffer.
-pub fn searchStream(key: []const u8, val: []const u8, pluck: ?[]const u8, writer: anytype) !void {
-    // 1. Build the quoted needles on the stack (increased to 4KB to prevent overflow)
-    var key_buf: [4096]u8 = undefined;
-    const key_quoted = try std.fmt.bufPrint(&key_buf, "\"{s}\"", .{key});
-    var val_buf: [4096]u8 = undefined;
-    const val_quoted = try std.fmt.bufPrint(&val_buf, "\"{s}\"", .{val});
-    
-    var pluck_buf: [4096]u8 = undefined;
-    var pluck_quoted: ?[]const u8 = null;
-    if (pluck) |p| pluck_quoted = try std.fmt.bufPrint(&pluck_buf, "\"{s}\"", .{p});
+// ==========================================
+// STABLE PRODUCER-CONSUMER
+// ==========================================
 
-    // 2. Setup a large Chunk Buffer (256KB)
-    const chunk_size = 256 * 1024;
-    var buffer: [chunk_size]u8 = undefined;
-    var bytes_in_buffer: usize = 0;
+const Buffer = struct {
+    data: []u8,
+    len: usize = 0,
+};
 
-    const stdin = std.io.getStdIn().reader();
+const ReaderCtx = struct {
+    file: std.fs.File,
+    bufs: [2]Buffer,
+    current_idx: usize = 0,
+    done: std.atomic.Value(bool),
+    fill_sem: *std.Thread.Semaphore,
+    read_sem: *std.Thread.Semaphore,
+};
 
-    // SIMD Setup
-    const vector_len = 64;
-    const V = @Vector(vector_len, u8);
-    const newline_vec: V = @splat('\n');
+fn readerThread(ctx: *ReaderCtx) void {
+    var leftover_count: usize = 0;
+    var leftover_buf: [2 * 1024 * 1024]u8 = undefined;
 
     while (true) {
-        // Read into the buffer, starting AFTER any leftover partial line
-        const read_count = try stdin.read(buffer[bytes_in_buffer..]);
-        if (read_count == 0 and bytes_in_buffer == 0) break;
+        ctx.read_sem.wait();
+        const buf = &ctx.bufs[ctx.current_idx];
         
-        const total_data = bytes_in_buffer + read_count;
+        // 1. Copy over leftover from previous read
+        if (leftover_count > 0) {
+            @memcpy(buf.data[0..leftover_count], leftover_buf[0..leftover_count]);
+        }
+
+        // 2. Read new data
+        const read_count = ctx.file.read(buf.data[leftover_count..]) catch 0;
+        
+        if (read_count == 0) {
+            buf.len = leftover_count;
+            ctx.done.store(true, .release);
+            ctx.fill_sem.post();
+            break;
+        }
+
+        const total_in_buf = leftover_count + read_count;
+        
+        // 3. Find line boundary and save leftover for next round
+        if (std.mem.lastIndexOfScalar(u8, buf.data[0..total_in_buf], '\n')) |idx| {
+            const boundary = idx + 1;
+            const new_leftover = total_in_buf - boundary;
+            if (new_leftover > 0) {
+                @memcpy(leftover_buf[0..new_leftover], buf.data[boundary..total_in_buf]);
+            }
+            leftover_count = new_leftover;
+            buf.len = boundary;
+        } else {
+            // Buffer didn't contain a newline (extremely long line)
+            buf.len = total_in_buf;
+            leftover_count = 0;
+        }
+
+        ctx.current_idx = 1 - ctx.current_idx;
+        ctx.fill_sem.post();
+    }
+}
+pub fn searchFile(allocator: std.mem.Allocator, file_path: []const u8, groups: []const main.ConditionGroup, pluck: ?[]const u8, writer: anytype) !void {
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+
+    const F_NOCACHE: i32 = 48;
+    _ = std.posix.system.fcntl(file.handle, F_NOCACHE, @as(i32, 1));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const plan = try compilePlan(arena.allocator(), groups, pluck);
+
+    var fill_sem = std.Thread.Semaphore{ .permits = 0 };
+    var read_sem = std.Thread.Semaphore{ .permits = 2 };
+
+    const buf_size = 8 * 1024 * 1024;
+    var ctx = ReaderCtx{
+        .file = file,
+        .bufs = .{
+            .{ .data = try allocator.alloc(u8, buf_size) },
+            .{ .data = try allocator.alloc(u8, buf_size) },
+        },
+        .done = std.atomic.Value(bool).init(false),
+        .fill_sem = &fill_sem,
+        .read_sem = &read_sem,
+    };
+    defer allocator.free(ctx.bufs[0].data);
+    defer allocator.free(ctx.bufs[1].data);
+
+    const thread = try std.Thread.spawn(.{}, readerThread, .{&ctx});
+    
+    var consume_idx: usize = 0;
+    while (true) {
+        fill_sem.wait();
+        const buf = &ctx.bufs[consume_idx];
+        
+        // Break condition
+        if (buf.len == 0 and ctx.done.load(.acquire)) break;
+
+        const data = buf.data[0..buf.len];
         var start_of_line: usize = 0;
         var i: usize = 0;
+        const vector_len = 32;
+        const V = @Vector(vector_len, u8);
+        const nl_vec: V = @splat('\n');
 
-        // 3. The SIMD Loop utilizing high-speed bitmask iteration
-        while (i + vector_len <= total_data) : (i += vector_len) {
-            const chunk: V = buffer[i..][0..vector_len].*;
-            const matches = chunk == newline_vec;
-            const mask = @as(u64, @bitCast(matches));
-
+        while (i + vector_len <= data.len) : (i += vector_len) {
+            const chunk: V = data[i..][0..vector_len].*;
+            const mask = @as(u32, @bitCast(chunk == nl_vec));
             if (mask != 0) {
                 var iter_mask = mask;
                 while (iter_mask != 0) {
                     const nl_pos = @ctz(iter_mask);
-                    const absolute_nl_pos = i + nl_pos;
-                    const line = buffer[start_of_line..absolute_nl_pos];
-                    
-                    if (lineMatches(line, key_quoted, val_quoted)) {
-                        try handleMatch(line, pluck_quoted, writer);
-                    }
-                    start_of_line = absolute_nl_pos + 1;
-                    iter_mask &= iter_mask - 1; // Clear bit to advance
+                    const abs_nl = i + nl_pos;
+                    const line = data[start_of_line..abs_nl];
+                    if (evaluatePlan(line, plan)) try handleMatch(line, plan.pluck_quoted, writer);
+                    start_of_line = abs_nl + 1;
+                    iter_mask &= iter_mask - 1;
                 }
             }
         }
 
-        // 4. Handle Leftovers (The "Shift")
-        // If there is data left after the last newline, move it to the front
-        if (start_of_line < total_data) {
-            const leftover_len = total_data - start_of_line;
-            // If the leftover is too big for our buffer, the line is > 256KB
-            if (leftover_len == chunk_size) return error.LineTooLong;
-            
-            std.mem.copyForwards(u8, buffer[0..leftover_len], buffer[start_of_line..total_data]);
-            bytes_in_buffer = leftover_len;
-        } else {
-            bytes_in_buffer = 0;
+        // Catch the remainder of the buffer that wasn't reached by the SIMD step
+        // (This happens if the buffer size isn't a multiple of 32)
+        while (start_of_line < data.len) {
+            if (std.mem.indexOfScalar(u8, data[start_of_line..], '\n')) |nl_pos| {
+                const abs_nl = start_of_line + nl_pos;
+                const line = data[start_of_line..abs_nl];
+                if (evaluatePlan(line, plan)) try handleMatch(line, plan.pluck_quoted, writer);
+                start_of_line = abs_nl + 1;
+            } else break;
         }
 
-        if (read_count == 0) {
-            // End of stream: process the very last line if it didn't end in \n
-            if (bytes_in_buffer > 0) {
-                const last_line = std.mem.trimRight(u8, buffer[0..bytes_in_buffer], "\r\n");
-                if (last_line.len > 0 and lineMatches(last_line, key_quoted, val_quoted)) {
-                    try handleMatch(last_line, pluck_quoted, writer);
-                }
-            }
-            break;
+        consume_idx = 1 - consume_idx;
+        read_sem.post();
+        if (ctx.done.load(.acquire) and fill_sem.permits == 0) break;
+    }
+    thread.join();
+
+    // If the file didn't end with a newline, there is still data in the 'next' buffer
+    // that the reader thread moved to the start but then hit EOF.
+    const final_buf = &ctx.bufs[ctx.current_idx];
+    if (final_buf.len > 0) {
+        // Trim any trailing garbage and process the very last line
+        const line = std.mem.trimRight(u8, final_buf.data[0..final_buf.len], "\r\n");
+        if (line.len > 0 and evaluatePlan(line, plan)) {
+            try handleMatch(line, plan.pluck_quoted, writer);
         }
     }
 }
 
-/// Maps a physical file to memory and processes it using SIMD vectors.
-pub fn searchFile(file_path: []const u8, key: []const u8, val: []const u8, pluck: ?[]const u8, writer: anytype) !void {
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
+pub fn searchStream(allocator: std.mem.Allocator, groups: []const main.ConditionGroup, pluck: ?[]const u8, writer: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const plan = try compilePlan(arena.allocator(), groups, pluck);
 
-    const file_size = (try file.metadata()).size();
-    if (file_size == 0) return;
+    const buffer_size = 1024 * 1024;
+    const buffer = try allocator.alloc(u8, buffer_size);
+    defer allocator.free(buffer);
+    
+    var bytes_in_buffer: usize = 0;
+    const stdin = std.io.getStdIn().reader();
 
-    const file_contents = try std.posix.mmap(
-        null, file_size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0,
-    );
-    defer std.posix.munmap(file_contents);
-
-    var key_buf: [4096]u8 = undefined;
-    const key_quoted = try std.fmt.bufPrint(&key_buf, "\"{s}\"", .{key});
-
-    var val_buf: [4096]u8 = undefined;
-    const val_quoted = try std.fmt.bufPrint(&val_buf, "\"{s}\"", .{val});
-
-    var pluck_buf: [4096]u8 = undefined;
-    var pluck_quoted: ?[]const u8 = null;
-    if (pluck) |p| {
-        pluck_quoted = try std.fmt.bufPrint(&pluck_buf, "\"{s}\"", .{p});
-    }
-
-    const vector_len = 64;
+    const vector_len = 32;
     const V = @Vector(vector_len, u8);
-    const newline_vec: V = @splat('\n');
+    const nl_vec: V = @splat('\n');
 
-    var start_of_line: usize = 0;
-    var i: usize = 0;
+    while (true) {
+        const read_count = try stdin.read(buffer[bytes_in_buffer..]);
+        if (read_count == 0 and bytes_in_buffer == 0) break;
+        const total_data = bytes_in_buffer + read_count;
+        var start_of_line: usize = 0;
+        var i: usize = 0;
 
-    // SIMD Loop utilizing high-speed bitmask iteration
-    while (i + vector_len <= file_contents.len) : (i += vector_len) {
-        const chunk: V = file_contents[i..][0..vector_len].*;
-        const matches = chunk == newline_vec;
-        const mask = @as(u64, @bitCast(matches));
-
-        if (mask != 0) {
-            var iter_mask = mask;
-            while (iter_mask != 0) {
-                const nl_pos = @ctz(iter_mask);
-                const absolute_nl_pos = i + nl_pos;
-                const line = file_contents[start_of_line..absolute_nl_pos];
-
-                if (lineMatches(line, key_quoted, val_quoted)) {
-                    try handleMatch(line, pluck_quoted, writer);
+        while (i + vector_len <= total_data) : (i += vector_len) {
+            const chunk: V = buffer[i..][0..vector_len].*;
+            const mask = @as(u32, @bitCast(chunk == nl_vec));
+            if (mask != 0) {
+                var iter_mask = mask;
+                while (iter_mask != 0) {
+                    const nl_pos = @ctz(iter_mask);
+                    const abs_nl = i + nl_pos;
+                    if (evaluatePlan(buffer[start_of_line..abs_nl], plan)) {
+                        try handleMatch(buffer[start_of_line..abs_nl], plan.pluck_quoted, writer);
+                    }
+                    start_of_line = abs_nl + 1;
+                    iter_mask &= iter_mask - 1;
                 }
-
-                start_of_line = absolute_nl_pos + 1;
-                iter_mask &= iter_mask - 1; // Clear bit to advance
             }
         }
+
+        if (start_of_line < total_data) {
+            bytes_in_buffer = total_data - start_of_line;
+            std.mem.copyForwards(u8, buffer[0..bytes_in_buffer], buffer[start_of_line..total_data]);
+        } else bytes_in_buffer = 0;
+        if (read_count == 0) break;
     }
-
-    // Process the final tail of the file
-    if (start_of_line < file_contents.len) {
-        const raw_tail = file_contents[start_of_line..];
-        // We trim the right to avoid double-newlines and ghost results
-        const last_line = std.mem.trimRight(u8, raw_tail, "\r\n");
-        
-        if (last_line.len > 0 and lineMatches(last_line, key_quoted, val_quoted)) {
-            try handleMatch(last_line, pluck_quoted, writer);
-        }
-    }
-}
-
-// ==========================================
-// TESTS
-// ==========================================
-const testing = std.testing;
-
-test "lineMatches ignores spaces and colons" {
-    const key = "\"level\"";
-    const val = "\"error\"";
-
-    // Standard format
-    try testing.expect(lineMatches("{\"level\":\"error\"}", key, val) == true);
-    // Spaced format
-    try testing.expect(lineMatches("{\"level\": \"error\"}", key, val) == true);
-    // Ugly formatting
-    try testing.expect(lineMatches("{\"level\"   :   \"error\"}", key, val) == true);
-    // False positive check
-    try testing.expect(lineMatches("{\"level\":\"info\"}", key, val) == false);
-}
-
-test "extractValue plucks strings and numbers" {
-    const key = "\"user_id\"";
-
-    // Pluck a number
-    const val1 = extractValue("{\"user_id\": 404, \"name\": \"bob\"}", key);
-    try testing.expectEqualStrings("404", val1.?);
-
-    // Pluck a string
-    const val2 = extractValue("{\"user_id\": \"uuid-123\"}", key);
-    try testing.expectEqualStrings("uuid-123", val2.?);
-}
-
-test "lineMatches handles iterative matching and false positives" {
-    const key = "\"level\"";
-    const val = "\"error\"";
-
-    // The key appears first inside a string value (false positive), 
-    // but the real match comes later.
-    try testing.expect(lineMatches("{\"msg\": \"the level is info\", \"level\": \"error\"}", key, val) == true);
-
-    // Key appears multiple times, none match the value.
-    try testing.expect(lineMatches("{\"msg\": \"level: error\", \"level\": \"info\"}", key, val) == false);
-}
-
-test "extractValue handles complex literal backslashes" {
-    const key = "\"path\"";
-
-    // Goal: Value is a literal double-backslash: \\
-    // JSON needs 4 backslashes: "path": "\\\\"
-    // Zig source needs 8 backslashes:
-    const val = extractValue("{\"path\": \"\\\\\\\\\"}", key);
-    
-    // This will succeed because backslash_count is 4 (even).
-    try testing.expectEqualStrings("\\\\\\\\", val.?); 
-}
-
-test "extractValue plucks booleans and nulls" {
-    // Test true
-    const val_true = extractValue("{\"active\": true, \"id\": 1}", "\"active\"");
-    try testing.expectEqualStrings("true", val_true.?);
-
-    // Test false
-    const val_false = extractValue("{\"active\": false}", "\"active\"");
-    try testing.expectEqualStrings("false", val_false.?);
-
-    // Test null
-    const val_null = extractValue("{\"data\": null, \"active\": true}", "\"data\"");
-    try testing.expectEqualStrings("null", val_null.?);
-}
-
-test "extractValue edge cases" {
-    const key = "\"id\"";
-
-    // Value at the very end of the string (no trailing comma or brace)
-    try testing.expectEqualStrings("123", extractValue("\"id\":123", key).?);
-
-    // Deeply nested lookalike key
-    const nested = "{\"outer\": {\"id\": 1}, \"id\": 2}";
-    try testing.expectEqualStrings("1", extractValue(nested, key).?);
-    
-    // Key not found
-    try testing.expect(extractValue("{\"name\": \"bob\"}", key) == null);
 }
