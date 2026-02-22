@@ -487,23 +487,21 @@ fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, wri
             const full_key = search[0 .. end_quote_idx.? + 2];
             search = search[end_quote_idx.? + 2 ..];
             
-            var matched_idx: ?usize = null;
-            for (pluck_keys[0..max_keys], 0..) |pk, i| {
-                if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
-                    matched_idx = i;
-                    break;
-                }
-            }
-            
-            if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos| {
+            if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos|
+            {
                 if (search[colon_pos] == ':') {
                     const rest = search[colon_pos + 1 ..];
                     if (std.mem.indexOfNone(u8, rest, " \t")) |val_start| {
-                        if (extractValueFromRest(rest[val_start..])) |val| {
-                            if (matched_idx) |idx| {
-                                results[idx] = val;
-                                found_count += 1;
+                        if (extractValueFromRest(rest[val_start..])) |val|
+                        {
+                            // FIX: Assign the extracted value to ALL pluck keys that want it!
+                            for (pluck_keys[0..max_keys], 0..) |pk, i| {
+                                if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
+                                    results[i] = val;
+                                    found_count += 1;
+                                }
                             }
+
                             if (rest[val_start] == '"') {
                                 search = rest[val_start + val.len + 2 ..]; 
                             } else {

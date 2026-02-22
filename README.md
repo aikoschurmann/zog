@@ -7,23 +7,24 @@
 
 ## 🚀 Benchmarks
 
-Tested on a **10 GB JSONL dataset** (67 million lines) on a modern NVMe SSD.
+Tested on a **1 GB JSONL dataset** (6.7 million lines) on a modern NVMe SSD.
 
-| Benchmark              | zog (file) | zog (pipe) | grep       | jq         |
+| Benchmark              | zog (file) | zog (pipe) | ripgrep    | jq/jaq     |
 |------------------------|------------|------------|------------|------------|
-| Simple Query           | **3.13 GB/s** | 1.90 GB/s  | ~0.10 GB/s | ~0.04 GB/s |
-| Logical OR             | **2.21 GB/s** | 1.37 GB/s  | ~0.06 GB/s | ~0.05 GB/s |
-| Substring Match (HAS)  | **2.09 GB/s** | 1.35 GB/s  | ~0.10 GB/s | ~0.04 GB/s |
-| Multi-Filter (AND)     | **3.11 GB/s** | 1.77 GB/s  | ~0.05 GB/s | ~0.05 GB/s |
-| Numeric Comparison     | **3.11 GB/s** | 1.77 GB/s  | N/A        | ~0.05 GB/s |
-| Field Extraction       | **2.04 GB/s** | 1.47 GB/s  | N/A        | ~0.04 GB/s |
-| Complex Logic          | **2.00 GB/s** | 1.52 GB/s  | ~0.05 GB/s | ~0.05 GB/s |
+| Simple Key Match       | **3.03 GB/s** | 2.16 GB/s  | 2.24 GB/s  | 0.07 GB/s |
+| Substring Match (HAS)  | **2.21 GB/s** | 1.98 GB/s  | 1.42 GB/s  | 0.07 GB/s |
+| Numeric Comparison     | **2.78 GB/s** | 2.17 GB/s  | 2.82 GB/s  | 0.10 GB/s |
+| Field Extraction (TSV) | **2.36 GB/s** | 1.80 GB/s  | N/A        | 0.10 GB/s |
+| JSON Re-Formatting     | **2.33 GB/s** | 1.85 GB/s  | N/A        | 0.10 GB/s |
+| Aggregations           | **2.01 GB/s** | 1.68 GB/s  | N/A        | 0.05 GB/s |
+| Complex Logic (OR/AND) | **1.82 GB/s** | 1.56 GB/s  | 0.54 GB/s  | 0.06 GB/s |
 
 **Performance Summary:**
-- **30–60x faster** than `jq` for typical queries
-- **20–50x faster** than `grep` for structured searches
-- Saturates NVMe bandwidth at **3+ GB/s** for simple patterns
-- Maintains **1.5–2 GB/s** throughput even for complex multi-condition logic
+- **20–40x faster** than `jq/jaq` for typical queries
+- **Competitive with ripgrep** for simple pattern matching while offering structured field extraction
+- **1-2x faster than ripgrep** for complex multi-condition logic
+- Maintains **1.8–2.8 GB/s** throughput even with field extraction and aggregations
+- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX) at near line-speed (~2 GB/s)
 
 ---
 
@@ -57,8 +58,8 @@ Find all entries where `age` equals `30`:
 
 ```bash
 zog --file demo.jsonl age eq 30
-# {"name": "Bob", "age": 30, "balance": -50.25, "tier": 2}
-# {"name": "Charlie", "age": 30, "balance": 0.0, "tier": 3}
+# {"name": "Bob", "age": 30, "balance": -50.25, "active": false, "tier": 2}
+# {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
 ```
 
 Or from stdin:
@@ -73,42 +74,74 @@ cat demo.jsonl | zog age eq 30
 
 ```bash
 zog --file demo.jsonl age eq 30 AND tier gt 2
-# {"name": "Charlie", "age": 30, "balance": 0.0, "tier": 3}
+# {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
 ```
 
 **OR** - Any condition can match:
 
 ```bash
 zog --file demo.jsonl tier eq 1 OR tier eq 5
-# {"name": "Alice", "age": 25, "balance": 100.50, "tier": 1}
-# {"name": "Eve", "age": "45", "balance": "99.99", "tier": 5}
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Eve", "age": "45", "balance": "99.99", "active": "true", "tier": 5}
 ```
 
 **Mixed Logic:**
 
 ```bash
-zog age eq 30 AND balance lt 0 OR tier eq 1
-# {"name": "Alice", "age": 25, "balance": 100.50, "tier": 1}
-# {"name": "Bob", "age": 30, "balance": -50.25, "tier": 2}
+zog --file demo.jsonl age eq 30 AND balance lt 0 OR tier eq 1
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Bob", "age": 30, "balance": -50.25, "active": false, "tier": 2}
 ```
+
+### Query Semantics & Order of Operations
+
+**Operator Precedence:** `AND` binds tighter than `OR`
+
+zog evaluates conditions left-to-right, grouping consecutive `AND` conditions together. Each `OR` creates a new group.
+
+**Examples:**
+
+```bash
+# A AND B OR C AND D
+# Evaluated as: (A AND B) OR (C AND D)
+zog --file demo.jsonl age eq 30 AND balance lt 0 OR tier eq 1 AND active eq true
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Bob", "age": 30, "balance": -50.25, "active": false, "tier": 2}
+
+# A OR B AND C
+# Evaluated as: A OR (B AND C)
+zog --file demo.jsonl tier eq 1 OR age eq 30 AND balance lt 0
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Bob", "age": 30, "balance": -50.25, "active": false, "tier": 2}
+```
+
+**No Parentheses:** zog does not support explicit parentheses. For complex logic requiring different groupings, use multiple zog invocations:
+
+```bash
+# To get (A OR B) AND C, run two stages:
+cat data.jsonl | zog A OR B | zog C
+```
+
+**Field Evaluation:** When multiple fields are specified in SELECT, they're extracted independently—order doesn't affect results, only output column order.
 
 ### Comparison Operators
 
 ```bash
 # Greater than
 zog --file demo.jsonl balance gt 100
-# {"name": "Dave", "age": 45, "balance": 5000.00, "tier": 4}
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Dave", "age": 45, "balance": 5000.00, "active": true, "tier": 4}
 
 # Less than or equal
 zog --file demo.jsonl tier lte 2
-# {"name": "Alice", "age": 25, "balance": 100.50, "tier": 1}
-# {"name": "Bob", "age": 30, "balance": -50.25, "tier": 2}
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Bob", "age": 30, "balance": -50.25, "active": false, "tier": 2}
 
 # Not equal
 zog --file demo.jsonl age neq 30
-# {"name": "Alice", "age": 25, "balance": 100.50, "tier": 1}
-# {"name": "Dave", "age": 45, "balance": 5000.00, "tier": 4}
-# {"name": "Eve", "age": "45", "balance": "99.99", "tier": 5}
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Dave", "age": 45, "balance": 5000.00, "active": true, "tier": 4}
+# {"name": "Eve", "age": "45", "balance": "99.99", "active": "true", "tier": 5}
 ```
 
 ### Substring Matching
@@ -118,8 +151,8 @@ Use the `has` operator to search for substrings within values:
 ```bash
 # Find all entries with names containing "li"
 zog --file demo.jsonl name has li
-# {"name": "Alice", "age": 25, "balance": 100.50, "tier": 1}
-# {"name": "Charlie", "age": 30, "balance": 0.0, "tier": 3}
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
 ```
 
 ### Field Extraction (SELECT)
@@ -137,6 +170,80 @@ Bob     2
 Charlie 3
 Eve     5
 ```
+
+### Aggregations
+
+zog can compute aggregations over matching records at near line-speed (~2 GB/s):
+
+**Available Aggregations:**
+- `COUNT(field)` or `count:field` - Count non-null values
+- `SUM(field)` or `sum:field` - Sum numeric values
+- `MIN(field)` or `min:field` - Find minimum value
+- `MAX(field)` or `max:field` - Find maximum value
+
+**Syntax:** zog supports both SQL-style (`COUNT(field)`) and shell-safe colon syntax (`count:field`). The colon syntax avoids shell escaping issues.
+
+**Computation:** All aggregations are computed in a single pass over the data. Each field maintains its own independent aggregation state—`min:age` and `max:balance` don't conflict; they compute the minimum age and maximum balance separately.
+
+**Important:** If you include **any** aggregation (COUNT, SUM, MIN, MAX), zog switches to "aggregation mode" and outputs a single summary row. Raw fields (without an aggregation function) will output as `null` in JSON or empty in TSV/CSV:
+
+```bash
+# Mixing raw field with aggregations - raw field outputs null/empty
+zog --file demo.jsonl SELECT name,count:name WHERE tier gte 2
+# Output: <empty>    4
+# (name has no aggregation, so it's empty in the summary row)
+
+# Solution: Either use all raw fields or all aggregations
+zog --file demo.jsonl SELECT name WHERE tier gte 2        # Raw mode: prints each line
+zog --file demo.jsonl SELECT count:name WHERE tier gte 2  # Aggregation mode: prints summary
+```
+
+**Examples:**
+
+```bash
+# Independent aggregations on different fields
+zog --file demo.jsonl SELECT min:age,max:balance WHERE active eq true
+# Output: 25.0000    5000.0000
+# (minimum age is 25, maximum balance is 5000 - completely independent)
+
+# You can even do min AND max on the same field
+zog --file demo.jsonl SELECT min:age,max:age WHERE active eq true
+# Output: 25.0000    45.0000
+
+# Count all matching records
+zog --file demo.jsonl SELECT count:name WHERE tier gte 2
+# Output: 4
+
+# Multiple aggregations (colon syntax - recommended)
+zog --file demo.jsonl SELECT count:name,sum:balance,min:age,max:tier WHERE active eq true
+# Output: 4    5200.4900    25.0000    5.0000
+
+# SQL-style syntax (requires quoting to avoid shell interpretation)
+zog --file demo.jsonl SELECT "COUNT(name),SUM(balance)" WHERE tier gte 3
+# Output: 3    5099.9900
+
+# Total balance across all records (no WHERE clause needed)
+cat demo.jsonl | zog SELECT sum:balance
+# Output: 5150.2400
+```
+
+**Output Formats:**
+
+```bash
+# TSV (default)
+zog --file demo.jsonl SELECT count:name,sum:balance WHERE tier gte 2
+# 4    5049.7400
+
+# JSON
+zog --file demo.jsonl --format json SELECT count:name,sum:balance WHERE tier gte 2
+# {"count:name": 4, "sum:balance": 5049.7400}
+
+# CSV
+zog --file demo.jsonl --format csv SELECT count:name,sum:balance WHERE tier gte 2
+# 4,5049.7400
+```
+
+**Performance:** Aggregations run at ~2 GB/s—**40x faster** than jq while using zero heap allocations.
 
 ### Type Handling
 
@@ -215,6 +322,9 @@ zog --file demo.jsonl SELECT name WHERE tier gte 3 | sort
 # Charlie
 # Dave
 # Eve
+
+# Aggregate pipeline analytics
+cat logs.jsonl | zog SELECT sum:bytes,count:request_id WHERE status eq 200
 ```
 
 ---
@@ -230,11 +340,6 @@ Download the latest binary for your OS from the [Releases](https://github.com/ai
 ```bash
 # macOS (Apple Silicon)
 curl -L https://github.com/aikoschurmann/zog/releases/latest/download/zog-macos-arm64 -o zog
-chmod +x zog
-sudo mv zog /usr/local/bin/
-
-# macOS (Intel)
-curl -L https://github.com/aikoschurmann/zog/releases/latest/download/zog-macos-x64 -o zog
 chmod +x zog
 sudo mv zog /usr/local/bin/
 
@@ -330,6 +435,7 @@ zog is purpose-built for high-throughput log analysis and incident response:
 ✅ **DevOps & SRE:** Filter production logs for errors, slow queries, or HTTP 5xx responses  
 ✅ **Security:** Hunt for suspicious activity in audit logs or access logs  
 ✅ **Data Engineering:** Pre-filter massive datasets before loading into analysis tools  
+✅ **Analytics:** Compute aggregations (COUNT, SUM, MIN, MAX) over billions of records at 2+ GB/s  
 ✅ **CLI Workflows:** Chain with `grep`, `awk`, `sort`, `uniq` for powerful one-liners  
 ✅ **Real-time Monitoring:** Pipe live log streams (`tail -f`, `journalctl -f`) for instant filtering
 
@@ -344,4 +450,3 @@ zog is purpose-built for high-throughput log analysis and incident response:
 ## 🤝 Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request on [GitHub](https://github.com/aikoschurmann/zog).
-
