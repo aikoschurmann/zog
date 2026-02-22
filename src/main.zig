@@ -127,16 +127,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     } else if (std.ascii.startsWithIgnoreCase(p, "max:")) {
                         ptype = .max; key = p[4..];
                     } 
-                    // OLD: SQL-style syntax (e.g., COUNT(name)) - kept for backwards compatibility if quoted
-                    else if (std.ascii.startsWithIgnoreCase(p, "count(") and std.mem.endsWith(u8, p, ")")) {
-                        ptype = .count; key = p[6..p.len-1];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "sum(") and std.mem.endsWith(u8, p, ")")) {
-                        ptype = .sum; key = p[4..p.len-1];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "min(") and std.mem.endsWith(u8, p, ")")) {
-                        ptype = .min; key = p[4..p.len-1];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "max(") and std.mem.endsWith(u8, p, ")")) {
-                        ptype = .max; key = p[4..p.len-1];
-                    }
                     
                     try pluck_keys.append(.{ .key = key, .ptype = ptype, .original_str = p });
                 }

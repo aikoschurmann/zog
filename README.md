@@ -176,16 +176,16 @@ Eve     5
 zog can compute aggregations over matching records at near line-speed (~2 GB/s):
 
 **Available Aggregations:**
-- `COUNT(field)` or `count:field` - Count non-null values
-- `SUM(field)` or `sum:field` - Sum numeric values
-- `MIN(field)` or `min:field` - Find minimum value
-- `MAX(field)` or `max:field` - Find maximum value
+- `count:field` - Count non-null values
+- `sum:field` - Sum numeric values
+- `min:field` - Find minimum value
+- `max:field` - Find maximum value
 
-**Syntax:** zog supports both SQL-style (`COUNT(field)`) and shell-safe colon syntax (`count:field`). The colon syntax avoids shell escaping issues.
+**Syntax:** zog supports shell-safe colon syntax (`count:field`). The colon syntax avoids shell escaping issues.
 
 **Computation:** All aggregations are computed in a single pass over the data. Each field maintains its own independent aggregation state—`min:age` and `max:balance` don't conflict; they compute the minimum age and maximum balance separately.
 
-**Important:** If you include **any** aggregation (COUNT, SUM, MIN, MAX), zog switches to "aggregation mode" and outputs a single summary row. Raw fields (without an aggregation function) will output as `null` in JSON or empty in TSV/CSV:
+**Important:** If you include **any** aggregation (count, sum, min, max), zog switches to "aggregation mode" and outputs a single summary row. Raw fields (without an aggregation function) will output as `null` in JSON or empty in TSV/CSV:
 
 ```bash
 # Mixing raw field with aggregations - raw field outputs null/empty
@@ -219,7 +219,7 @@ zog --file demo.jsonl SELECT count:name,sum:balance,min:age,max:tier WHERE activ
 # Output: 4    5200.4900    25.0000    5.0000
 
 # SQL-style syntax (requires quoting to avoid shell interpretation)
-zog --file demo.jsonl SELECT "COUNT(name),SUM(balance)" WHERE tier gte 3
+zog --file demo.jsonl SELECT count:name,sum:balance WHERE tier gte 3
 # Output: 3    5099.9900
 
 # Total balance across all records (no WHERE clause needed)
