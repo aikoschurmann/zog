@@ -214,13 +214,9 @@ zog --file demo.jsonl SELECT min:age,max:age WHERE active eq true
 zog --file demo.jsonl SELECT count:name WHERE tier gte 2
 # Output: 4
 
-# Multiple aggregations (colon syntax - recommended)
+# Multiple aggregations
 zog --file demo.jsonl SELECT count:name,sum:balance,min:age,max:tier WHERE active eq true
 # Output: 4    5200.4900    25.0000    5.0000
-
-# SQL-style syntax (requires quoting to avoid shell interpretation)
-zog --file demo.jsonl SELECT count:name,sum:balance WHERE tier gte 3
-# Output: 3    5099.9900
 
 # Total balance across all records (no WHERE clause needed)
 cat demo.jsonl | zog SELECT sum:balance
