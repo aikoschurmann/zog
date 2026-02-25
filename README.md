@@ -11,20 +11,20 @@ Tested on a **1 GB JSONL dataset** (6.7 million lines) on a modern NVMe SSD.
 
 | Benchmark              | zog (file) | zog (pipe) | ripgrep    | jq/jaq     |
 |------------------------|------------|------------|------------|------------|
-| Simple Key Match       | **3.03 GB/s** | 2.16 GB/s  | 2.24 GB/s  | 0.07 GB/s |
-| Substring Match (HAS)  | **2.21 GB/s** | 1.98 GB/s  | 1.42 GB/s  | 0.07 GB/s |
-| Numeric Comparison     | **2.78 GB/s** | 2.17 GB/s  | 2.82 GB/s  | 0.10 GB/s |
-| Field Extraction (TSV) | **2.36 GB/s** | 1.80 GB/s  | N/A        | 0.10 GB/s |
-| JSON Re-Formatting     | **2.33 GB/s** | 1.85 GB/s  | N/A        | 0.10 GB/s |
-| Aggregations           | **2.01 GB/s** | 1.68 GB/s  | N/A        | 0.05 GB/s |
-| Complex Logic (OR/AND) | **1.82 GB/s** | 1.56 GB/s  | 0.54 GB/s  | 0.06 GB/s |
+| Simple Key Match       | **3.57 GB/s** | 2.31 GB/s  | 2.33 GB/s  | 0.07 GB/s |
+| Substring Match (HAS)  | **2.46 GB/s** | 2.04 GB/s  | 1.52 GB/s  | 0.07 GB/s |
+| Numeric Comparison     | **2.87 GB/s** | 2.29 GB/s  | 2.97 GB/s  | 0.10 GB/s |
+| Field Extraction (TSV) | **2.48 GB/s** | 2.02 GB/s  | N/A        | 0.10 GB/s |
+| JSON Re-Formatting     | **2.45 GB/s** | 1.96 GB/s  | N/A        | 0.10 GB/s |
+| Aggregations           | **2.15 GB/s** | 1.82 GB/s  | N/A        | 0.05 GB/s |
+| Complex Logic (OR/AND) | **1.79 GB/s** | 1.50 GB/s  | 0.55 GB/s  | 0.06 GB/s |
 
 **Performance Summary:**
-- **20–40x faster** than `jq/jaq` for typical queries
-- **Competitive with ripgrep** for simple pattern matching while offering structured field extraction
-- **1-2x faster than ripgrep** for complex multi-condition logic
-- Maintains **1.8–2.8 GB/s** throughput even with field extraction and aggregations
-- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX) at near line-speed (~2 GB/s)
+- **20–50x faster** than `jq/jaq` for typical queries
+- **Faster than ripgrep** for key matching and substring search while offering structured field extraction
+- **3x faster than ripgrep** for complex multi-condition logic
+- Maintains **1.7–3.5 GB/s** throughput even with field extraction and aggregations
+- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX) at near line-speed (>2 GB/s)
 
 ---
 
