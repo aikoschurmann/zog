@@ -210,7 +210,9 @@ inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, quote_vec: V
             if (line.len - pos >= cond.key_quoted.len) {
                 if (std.mem.eql(u8, line[pos + 2 .. pos + cond.key_quoted.len], cond.key_quoted[2..])) {
                     const rest = line[pos + cond.key_quoted.len..];
-                    if (std.mem.indexOfNone(u8, rest, " \t:")) |si| {
+                    var si: usize = 0;
+                    while (si < rest.len and (rest[si] == ' ' or rest[si] == '\t' or rest[si] == ':')) : (si += 1) {}
+                    if (si < rest.len) {
                         if (evaluateValue(rest[si..], cond)) return true;
                     }
                 }
@@ -229,7 +231,9 @@ fn lineMatches(line: []const u8, cond: CompiledCondition) bool {
             if (line[j] == '"' and line[j+1] == cond.key_quoted[1]) {
                 if (std.mem.eql(u8, line[j + 2 .. j + cond.key_quoted.len], cond.key_quoted[2..])) {
                     const rest = line[j + cond.key_quoted.len..];
-                    if (std.mem.indexOfNone(u8, rest, " \t:")) |si| { if (evaluateValue(rest[si..], cond)) return true; }
+                    var si: usize = 0;
+                    while (si < rest.len and (rest[si] == ' ' or rest[si] == '\t' or rest[si] == ':')) : (si += 1) {}
+                    if (si < rest.len) { if (evaluateValue(rest[si..], cond)) return true; }
                 }
             }
         }
@@ -321,7 +325,9 @@ inline fn extractValueSingle(line: []const u8, pk_quoted: []const u8) ?[]const u
     var search = line;
     while (std.mem.indexOf(u8, search, pk_quoted)) |kp| {
         const rest = search[kp + pk_quoted.len..];
-        if (std.mem.indexOfNone(u8, rest, " \t:")) |si| { 
+        var si: usize = 0;
+        while (si < rest.len and (rest[si] == ' ' or rest[si] == '\t' or rest[si] == ':')) : (si += 1) {}
+        if (si < rest.len) { 
             if (extractValueFromRest(rest[si..])) |val| return val; 
         }
         search = rest;
