@@ -11,20 +11,20 @@ Tested on a **1 GB JSONL dataset** (6.7 million lines) on a modern NVMe SSD.
 
 | Benchmark              | zog (file) | zog (pipe) | ripgrep    | jq/jaq     |
 |------------------------|------------|------------|------------|------------|
-| Simple Key Match       | **3.57 GB/s** | 2.31 GB/s  | 2.33 GB/s  | 0.07 GB/s |
-| Substring Match (HAS)  | **2.46 GB/s** | 2.04 GB/s  | 1.52 GB/s  | 0.07 GB/s |
-| Numeric Comparison     | **2.87 GB/s** | 2.29 GB/s  | 2.97 GB/s  | 0.10 GB/s |
-| Field Extraction (TSV) | **2.48 GB/s** | 2.02 GB/s  | N/A        | 0.10 GB/s |
-| JSON Re-Formatting     | **2.45 GB/s** | 1.96 GB/s  | N/A        | 0.10 GB/s |
-| Aggregations           | **2.15 GB/s** | 1.82 GB/s  | N/A        | 0.05 GB/s |
-| Complex Logic (OR/AND) | **1.79 GB/s** | 1.50 GB/s  | 0.55 GB/s  | 0.06 GB/s |
+| Simple Key Match       | **3.79 GB/s** | 2.41 GB/s  | 2.33 GB/s  | 0.07 GB/s |
+| Substring Match (HAS)  | **2.47 GB/s** | 2.06 GB/s  | 1.53 GB/s  | 0.07 GB/s |
+| Numeric Comparison     | **3.19 GB/s** | 2.46 GB/s  | 3.08 GB/s  | 0.10 GB/s |
+| Field Extraction (TSV) | **2.66 GB/s** | 2.16 GB/s  | N/A        | 0.10 GB/s |
+| JSON Re-Formatting     | **2.64 GB/s** | 2.08 GB/s  | N/A        | 0.10 GB/s |
+| Aggregations           | **2.33 GB/s** | 1.91 GB/s  | N/A        | 0.05 GB/s |
+| Complex Logic (OR/AND) | **1.90 GB/s** | 1.57 GB/s  | 0.56 GB/s  | 0.06 GB/s |
 
 **Performance Summary:**
 - **20–50x faster** than `jq/jaq` for typical queries
-- **Faster than ripgrep** for key matching and substring search while offering structured field extraction
-- **3x faster than ripgrep** for complex multi-condition logic
-- Maintains **1.7–3.5 GB/s** throughput even with field extraction and aggregations
-- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX) at near line-speed (>2 GB/s)
+- **Faster than ripgrep** for all matching categories while offering structured field extraction
+- **3.4x faster than ripgrep** for complex multi-condition logic
+- Maintains **1.9–3.8 GB/s** throughput even with field extraction and aggregations
+- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX) at near line-speed (>2.3 GB/s)
 
 ---
 
