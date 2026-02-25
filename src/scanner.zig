@@ -29,8 +29,6 @@ const CompiledPluck = struct {
 const CompiledPlan = struct {
     groups: []CompiledGroup,
     pluck: []CompiledPluck,
-    unique_first_chars: []u8,
-    char_vectors: []V, 
     has_aggregations: bool,
     format: main.OutputFormat,
 };
@@ -88,14 +86,11 @@ inline fn parseFastInt(s: []const u8) ?i64 {
 
 fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan {
     var comp_groups = try allocator.alloc(CompiledGroup, config.groups.len);
-    var unique_list = std.ArrayList(u8).init(allocator);
-    var seen_chars = [_]bool{false} ** 256;
 
     for (config.groups, 0..) |g, i| {
         var comp_conds = try allocator.alloc(CompiledCondition, g.conditions.len);
         for (g.conditions, 0..) |c, j| {
             const key_q = try std.fmt.allocPrint(allocator, "\"{s}\"", .{c.key});
-            if (!seen_chars[key_q[1]]) { seen_chars[key_q[1]] = true; try unique_list.append(key_q[1]); }
 
             var actual_val = c.val;
             var type_forced: TypeForced = .none;
@@ -116,10 +111,6 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
         comp_groups[i] = .{ .conditions = comp_conds };
     }
 
-    const ufc = try unique_list.toOwnedSlice();
-    var cvs = try allocator.alloc(V, ufc.len);
-    for (ufc, 0..) |char, i| cvs[i] = @splat(char);
-
     var pks = try allocator.alloc(CompiledPluck, config.pluck.len);
     var has_aggs = false;
     for (config.pluck, 0..) |p, i| {
@@ -134,8 +125,6 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
     return CompiledPlan{ 
         .groups = comp_groups, 
         .pluck = pks, 
-        .unique_first_chars = ufc, 
-        .char_vectors = cvs,
         .has_aggregations = has_aggs,
         .format = config.format,
     };
@@ -254,38 +243,11 @@ fn lineMatches(line: []const u8, cond: CompiledCondition) bool {
 inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
     if (plan.groups.len == 0) return true;
     if (line.len < 2) return false;
-    var might_match = false;
-    const qv: V = @splat('"');
 
-    if (line.len >= VECTOR_LEN + 1) {
-        var i: usize = 0;
-        while (i + VECTOR_LEN + 1 <= line.len) {
-            const chunk: V = line[i..][0..VECTOR_LEN].*;
-            const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
-            const qm = @as(u32, @bitCast(chunk == qv));
-            for (plan.char_vectors) |cv| {
-                if (qm & @as(u32, @bitCast(next_chunk == cv)) != 0) { might_match = true; break; }
-            }
-            if (might_match) break;
-            i += VECTOR_LEN;
-        }
-        if (!might_match) {
-            const tail_i = line.len - VECTOR_LEN - 1;
-            const qm = @as(u32, @bitCast(line[tail_i..][0..VECTOR_LEN].* == qv));
-            for (plan.char_vectors) |cv| {
-                if (qm & @as(u32, @bitCast(line[tail_i + 1..][0..VECTOR_LEN].* == cv)) != 0) { might_match = true; break; }
-            }
-        }
-    } else {
-        for (plan.unique_first_chars) |char| { if (std.mem.indexOfScalar(u8, line, char) != null) { might_match = true; break; } }
-    }
-
-    if (might_match) {
-        for (plan.groups) |group| {
-            var gm = true;
-            for (group.conditions) |cond| { if (!lineMatches(line, cond)) { gm = false; break; } }
-            if (gm) return true;
-        }
+    for (plan.groups) |group| {
+        var gm = true;
+        for (group.conditions) |cond| { if (!lineMatches(line, cond)) { gm = false; break; } }
+        if (gm) return true;
     }
     return false;
 }
