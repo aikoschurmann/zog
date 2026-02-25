@@ -65,10 +65,7 @@ inline fn isFastPrimitive(val: []const u8) bool {
 }
 
 inline fn isPrimitiveTerminator(c: u8) bool {
-    return switch (c) {
-        ',', '}', ']', ' ', '\t', '\r', '\n' => true,
-        else => false,
-    };
+    return TermMask[c];
 }
 
 inline fn parseFastInt(s: []const u8) ?i64 {
@@ -210,10 +207,12 @@ inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, quote_vec: V
         while (mask != 0) {
             const bit_pos = @ctz(mask);
             const pos = i + bit_pos;
-            if (std.mem.startsWith(u8, line[pos..], cond.key_quoted)) {
-                const rest = line[pos + cond.key_quoted.len..];
-                if (std.mem.indexOfNone(u8, rest, " \t:")) |si| {
-                    if (evaluateValue(rest[si..], cond)) return true;
+            if (line.len - pos >= cond.key_quoted.len) {
+                if (std.mem.eql(u8, line[pos + 2 .. pos + cond.key_quoted.len], cond.key_quoted[2..])) {
+                    const rest = line[pos + cond.key_quoted.len..];
+                    if (std.mem.indexOfNone(u8, rest, " \t:")) |si| {
+                        if (evaluateValue(rest[si..], cond)) return true;
+                    }
                 }
             }
             mask &= mask - 1;
@@ -228,7 +227,7 @@ fn lineMatches(line: []const u8, cond: CompiledCondition) bool {
         var j: usize = 0;
         while (j + cond.key_quoted.len <= line.len) : (j += 1) {
             if (line[j] == '"' and line[j+1] == cond.key_quoted[1]) {
-                if (std.mem.startsWith(u8, line[j..], cond.key_quoted)) {
+                if (std.mem.eql(u8, line[j + 2 .. j + cond.key_quoted.len], cond.key_quoted[2..])) {
                     const rest = line[j + cond.key_quoted.len..];
                     if (std.mem.indexOfNone(u8, rest, " \t:")) |si| { if (evaluateValue(rest[si..], cond)) return true; }
                 }
@@ -287,6 +286,12 @@ inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
     return false;
 }
 
+const TermMask = blk: {
+    var mask = [_]bool{false} ** 256;
+    for (",}] \t\r\n") |c| mask[c] = true;
+    break :blk mask;
+};
+
 inline fn extractValueFromRest(vs: []const u8) ?[]const u8 {
     if (vs.len == 0) return null;
     if (vs[0] == '"') {
@@ -303,7 +308,12 @@ inline fn extractValueFromRest(vs: []const u8) ?[]const u8 {
                 break;
             }
         }
-    } else if (std.mem.indexOfAny(u8, vs, ",}] \t\r\n")) |ei| return vs[0..ei];
+    } else {
+        var i: usize = 0;
+        while (i < vs.len) : (i += 1) {
+            if (TermMask[vs[i]]) return vs[0..i];
+        }
+    }
     return vs;
 }
 
@@ -467,8 +477,9 @@ fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, wri
         return;
     }
 
-    var results: [256]?[]const u8 = .{null} ** 256;
+    var results: [256]?[]const u8 = undefined;
     const max_keys = @min(pluck_keys.len, 256);
+    @memset(results[0..max_keys], null);
     
     if (pluck_keys.len == 1) {
         if (extractValueSingle(line, pluck_keys[0].key_quoted)) |val| {
