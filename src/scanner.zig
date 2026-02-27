@@ -138,7 +138,7 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
     };
 }
 
-inline fn evaluateValue(rest_si: []const u8, cond: CompiledCondition) bool {
+inline fn evaluateValue(rest_si: []const u8, cond: *const CompiledCondition) bool {
     const is_json_string = rest_si.len > 0 and rest_si[0] == '"';
 
     switch (cond.op) {
@@ -197,10 +197,10 @@ inline fn evaluateValue(rest_si: []const u8, cond: CompiledCondition) bool {
     }
 }
 
-inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, i: usize) bool {
+inline fn checkSimdChunk(line: []const u8, cond: *const CompiledCondition, fcv: V, i: usize) bool {
     const chunk: V = line[i..][0..VECTOR_LEN].*;
     const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
-    const matches_mask = @as(u32, @bitCast(chunk == QUOTE_VEC)) & @as(u32, @bitCast(next_chunk == cond.fcv));
+    const matches_mask = @as(u32, @bitCast(chunk == QUOTE_VEC)) & @as(u32, @bitCast(next_chunk == fcv));
 
     if (matches_mask != 0) {
         var mask = matches_mask;
@@ -224,7 +224,7 @@ inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, i: usize) bo
     return false;
 }
 
-fn lineMatches(line: []const u8, cond: CompiledCondition) bool {
+inline fn lineMatchesInternal(line: []const u8, cond: *const CompiledCondition, fcv: V) bool {
     if (line.len < 2) return false;
     if (line.len < VECTOR_LEN + 1) {
         var j: usize = 0;
@@ -246,32 +246,23 @@ fn lineMatches(line: []const u8, cond: CompiledCondition) bool {
 
     var i: usize = 0;
     while (i + VECTOR_LEN + 1 <= line.len) {
-        if (checkSimdChunk(line, cond, i)) return true;
+        if (checkSimdChunk(line, cond, fcv, i)) return true;
         i += VECTOR_LEN;
     }
     const tail_i = line.len - VECTOR_LEN - 1;
-    return checkSimdChunk(line, cond, tail_i);
+    return checkSimdChunk(line, cond, fcv, tail_i);
 }
 
-inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
+inline fn evaluatePlan(line: []const u8, plan: *const CompiledPlan) bool {
     if (plan.groups.len == 0) return true;
     if (line.len < 2) return false;
 
-    // Fast path: Single group with single condition (the 95% case)
-    if (plan.groups.len == 1 and plan.groups[0].conditions.len == 1) {
-        const cond = plan.groups[0].conditions[0];
-        const matches = lineMatches(line, cond);
-        return if (cond.negated) !matches else matches;
-    }
-
-    for (plan.groups) |group| {
+    for (plan.groups) |*group| {
         var gm = true;
-        for (group.conditions) |cond| { 
-            const matches = lineMatches(line, cond);
-            if (cond.negated) {
-                if (matches) { gm = false; break; }
-            } else {
-                if (!matches) { gm = false; break; }
+        for (group.conditions) |*cond| { 
+            if (lineMatchesInternal(line, cond, cond.fcv) == cond.negated) {
+                gm = false;
+                break;
             }
         }
         if (gm) return true;
@@ -468,7 +459,7 @@ fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck
     }
 }
 
-fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, writer: anytype) !void {
+fn handleMatch(line: []const u8, plan: *const CompiledPlan, agg_states: []AggState, writer: anytype) !void {
     const pluck_keys = plan.pluck;
     if (pluck_keys.len == 0) {
         try writer.writeAll(line);
@@ -576,6 +567,150 @@ pub fn searchStream(allocator: std.mem.Allocator, config: main.Config, writer: a
     try searchFileInternal(allocator, std.io.getStdIn(), config, writer);
 }
 
+inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan: *const CompiledPlan, ctx: *ReaderCtx, agg_states: []AggState, writer: anytype) !void {
+    var consume_idx: usize = 0;
+    const nlv: V = @splat('\n');
+
+    // Pre-hoist the single condition to a register/stack local if possible
+    const single_cond = if (is_single) &plan.groups[0].conditions[0] else undefined;
+    const fcv = if (is_single) single_cond.fcv else undefined;
+
+    if (comptime has_limit) {
+        const limit = plan.limit.?;
+        var match_count: usize = 0;
+        outer: while (true) {
+            ctx.fill_sem.wait();
+            const buf = &ctx.bufs[consume_idx];
+            if (buf.len == 0 and ctx.done.load(.acquire)) break;
+
+            const data = buf.data[0..buf.len];
+            var sol: usize = 0;
+            var i: usize = 0;
+
+            while (i + VECTOR_LEN <= data.len) : (i += VECTOR_LEN) {
+                const mask = @as(u32, @bitCast(data[i..][0..VECTOR_LEN].* == nlv));
+                if (mask != 0) {
+                    var iter = mask;
+                    while (iter != 0) {
+                        const nl_pos = @ctz(iter);
+                        const line = data[sol .. i + nl_pos];
+                        
+                        const is_match = if (is_single) 
+                            lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
+                        else evaluatePlan(line, plan);
+
+                        if (is_match) {
+                            try handleMatch(line, plan, agg_states, writer);
+                            match_count += 1;
+                            if (match_count >= limit) {
+                                ctx.done.store(true, .release);
+                                break :outer;
+                            }
+                        }
+                        sol = i + nl_pos + 1;
+                        iter &= iter - 1;
+                    }
+                }
+            }
+            while (sol < data.len) {
+                if (std.mem.indexOfScalar(u8, data[sol..], '\n')) |nl_pos| {
+                    const line = data[sol .. sol + nl_pos];
+                    const is_match = if (is_single) 
+                        lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
+                    else evaluatePlan(line, plan);
+
+                    if (is_match) {
+                        try handleMatch(line, plan, agg_states, writer);
+                        match_count += 1;
+                        if (match_count >= limit) {
+                            ctx.done.store(true, .release);
+                            break :outer;
+                        }
+                    }
+                    sol += nl_pos + 1;
+                } else break;
+            }
+            if (ctx.done.load(.acquire) and sol < data.len and match_count < limit) {
+                const line = std.mem.trimRight(u8, data[sol..], "\r\n");
+                if (line.len > 0) {
+                    const is_match = if (is_single) 
+                        lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
+                    else evaluatePlan(line, plan);
+
+                    if (is_match) {
+                        try handleMatch(line, plan, agg_states, writer);
+                        match_count += 1;
+                    }
+                }
+                sol = data.len;
+            }
+            consume_idx = 1 - consume_idx;
+            ctx.read_sem.post();
+            if (ctx.done.load(.acquire) and ctx.fill_sem.permits == 0) break;
+            if (match_count >= limit) break;
+        }
+    } else {
+        while (true) {
+            ctx.fill_sem.wait();
+            const buf = &ctx.bufs[consume_idx];
+            if (buf.len == 0 and ctx.done.load(.acquire)) break;
+
+            const data = buf.data[0..buf.len];
+            var sol: usize = 0;
+            var i: usize = 0;
+
+            while (i + VECTOR_LEN <= data.len) : (i += VECTOR_LEN) {
+                const mask = @as(u32, @bitCast(data[i..][0..VECTOR_LEN].* == nlv));
+                if (mask != 0) {
+                    var iter = mask;
+                    while (iter != 0) {
+                        const nl_pos = @ctz(iter);
+                        const line = data[sol .. i + nl_pos];
+                        const is_match = if (is_single) 
+                            lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
+                        else evaluatePlan(line, plan);
+
+                        if (is_match) {
+                            try handleMatch(line, plan, agg_states, writer);
+                        }
+                        sol = i + nl_pos + 1;
+                        iter &= iter - 1;
+                    }
+                }
+            }
+            while (sol < data.len) {
+                if (std.mem.indexOfScalar(u8, data[sol..], '\n')) |nl_pos| {
+                    const line = data[sol .. sol + nl_pos];
+                    const is_match = if (is_single) 
+                        lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
+                    else evaluatePlan(line, plan);
+
+                    if (is_match) {
+                        try handleMatch(line, plan, agg_states, writer);
+                    }
+                    sol += nl_pos + 1;
+                } else break;
+            }
+            if (ctx.done.load(.acquire) and sol < data.len) {
+                const line = std.mem.trimRight(u8, data[sol..], "\r\n");
+                if (line.len > 0) {
+                    const is_match = if (is_single) 
+                        lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
+                    else evaluatePlan(line, plan);
+
+                    if (is_match) {
+                        try handleMatch(line, plan, agg_states, writer);
+                    }
+                }
+                sol = data.len;
+            }
+            consume_idx = 1 - consume_idx;
+            ctx.read_sem.post();
+            if (ctx.done.load(.acquire) and ctx.fill_sem.permits == 0) break;
+        }
+    }
+}
+
 fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: main.Config, writer: anytype) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -601,62 +736,22 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
     defer allocator.free(ctx.bufs[1].data);
     
     const thread = try std.Thread.spawn(.{}, readerThread, .{&ctx});
-    var consume_idx: usize = 0;
-    var match_count: usize = 0;
     
-    while (true) {
-        fill_sem.wait();
-        const buf = &ctx.bufs[consume_idx];
-        if (buf.len == 0 and ctx.done.load(.acquire)) break;
-
-        const data = buf.data[0..buf.len];
-        var sol: usize = 0;
-        var i: usize = 0;
-        const nlv: V = @splat('\n');
-        
-        while (i + VECTOR_LEN <= data.len) : (i += VECTOR_LEN) {
-            const mask = @as(u32, @bitCast(data[i..][0..VECTOR_LEN].* == nlv));
-            if (mask != 0) {
-                var iter = mask;
-                while (iter != 0) {
-                    const nl_pos = @ctz(iter);
-                    const line = data[sol .. i + nl_pos];
-                    if (evaluatePlan(line, plan)) {
-                        try handleMatch(line, plan, agg_states, writer);
-                        match_count += 1;
-                        if (plan.limit) |l| { if (match_count >= l) { ctx.done.store(true, .release); break; } }
-                    }
-                    sol = i + nl_pos + 1;
-                    iter &= iter - 1;
-                }
-            }
-            if (plan.limit) |l| { if (match_count >= l) break; }
+    const is_single = plan.groups.len == 1 and plan.groups[0].conditions.len == 1;
+    if (plan.limit != null) {
+        if (is_single) {
+            try runSearchLoop(true, true, &plan, &ctx, agg_states, writer);
+        } else {
+            try runSearchLoop(true, false, &plan, &ctx, agg_states, writer);
         }
-        while (sol < data.len) {
-            if (std.mem.indexOfScalar(u8, data[sol..], '\n')) |nl_pos| {
-                const line = data[sol .. sol + nl_pos];
-                if (evaluatePlan(line, plan)) {
-                    try handleMatch(line, plan, agg_states, writer);
-                    match_count += 1;
-                    if (plan.limit) |l| { if (match_count >= l) { ctx.done.store(true, .release); break; } }
-                }
-                sol += nl_pos + 1;
-            } else break;
+    } else {
+        if (is_single) {
+            try runSearchLoop(false, true, &plan, &ctx, agg_states, writer);
+        } else {
+            try runSearchLoop(false, false, &plan, &ctx, agg_states, writer);
         }
-        if (ctx.done.load(.acquire) and sol < data.len and (plan.limit == null or match_count < plan.limit.?)) {
-            const line = std.mem.trimRight(u8, data[sol..], "\r\n");
-            if (line.len > 0 and evaluatePlan(line, plan)) {
-                try handleMatch(line, plan, agg_states, writer);
-                match_count += 1;
-                if (plan.limit) |l| { if (match_count >= l) { ctx.done.store(true, .release); break; } }
-            }
-            sol = data.len;
-        }
-        consume_idx = 1 - consume_idx;
-        read_sem.post();
-        if (ctx.done.load(.acquire) and fill_sem.permits == 0) break;
-        if (plan.limit) |l| { if (match_count >= l) break; }
     }
+    
     thread.join();
 
     if (plan.has_aggregations) {

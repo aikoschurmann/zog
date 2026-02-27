@@ -11,20 +11,20 @@ Tested on a **1 GB JSONL dataset** (6.7 million lines) on a modern NVMe SSD.
 
 | Benchmark              | zog (file) | zog (pipe) | ripgrep    | jq/jaq     |
 |------------------------|------------|------------|------------|------------|
-| Simple Key Match       | **3.79 GB/s** | 2.41 GB/s  | 2.33 GB/s  | 0.07 GB/s |
-| Substring Match (HAS)  | **2.47 GB/s** | 2.06 GB/s  | 1.53 GB/s  | 0.07 GB/s |
-| Numeric Comparison     | **3.19 GB/s** | 2.46 GB/s  | 3.08 GB/s  | 0.10 GB/s |
-| Field Extraction (TSV) | **2.66 GB/s** | 2.16 GB/s  | N/A        | 0.10 GB/s |
-| JSON Re-Formatting     | **2.64 GB/s** | 2.08 GB/s  | N/A        | 0.10 GB/s |
-| Aggregations           | **2.33 GB/s** | 1.91 GB/s  | N/A        | 0.05 GB/s |
-| Complex Logic (OR/AND) | **1.90 GB/s** | 1.57 GB/s  | 0.56 GB/s  | 0.06 GB/s |
+| Simple Key Match       | **4.03 GB/s** | 2.38 GB/s  | 2.30 GB/s  | 0.07 GB/s |
+| Substring Match (HAS)  | **2.49 GB/s** | 2.09 GB/s  | 1.53 GB/s  | 0.07 GB/s |
+| Numeric Comparison     | **3.39 GB/s** | 2.41 GB/s  | 2.97 GB/s  | 0.10 GB/s |
+| Field Extraction (TSV) | **2.83 GB/s** | 2.21 GB/s  | N/A        | 0.10 GB/s |
+| JSON Re-Formatting     | **2.77 GB/s** | 2.18 GB/s  | N/A        | 0.10 GB/s |
+| Aggregations           | **2.41 GB/s** | 1.91 GB/s  | N/A        | 0.05 GB/s |
+| Complex Logic (OR/AND) | **2.24 GB/s** | 1.93 GB/s  | 0.54 GB/s  | 0.06 GB/s |
 
 **Performance Summary:**
 - **20–50x faster** than `jq/jaq` for typical queries
 - **Faster than ripgrep** for all matching categories while offering structured field extraction
-- **3.4x faster than ripgrep** for complex multi-condition logic
-- Maintains **1.9–3.8 GB/s** throughput even with field extraction and aggregations
-- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX) at near line-speed (>2.3 GB/s)
+- **4.1x faster than ripgrep** for complex multi-condition logic
+- Maintains **1.9–4.0 GB/s** throughput even with field extraction and aggregations
+- **Unique capability:** Aggregations (COUNT, SUM, MIN, MAX, AVG) at near line-speed (>2.4 GB/s)
 
 ---
 
