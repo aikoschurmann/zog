@@ -1,17 +1,18 @@
 const std = @import("std");
 const Scanner = @import("scanner.zig");
 
-pub const Operator = enum { eq, neq, gt, lt, gte, lte, has };
+pub const Operator = enum { eq, neq, gt, lt, gte, lte, has, exists };
 pub const Condition = struct {
     key: []const u8,
     val: []const u8,
     op: Operator,
+    negated: bool = false,
 };
 pub const ConditionGroup = struct {
     conditions: []Condition,
 };
 pub const OutputFormat = enum { tsv, csv, json };
-pub const PluckType = enum { raw, count, sum, min, max };
+pub const PluckType = enum { raw, count, sum, min, max, avg };
 pub const PluckField = struct {
     key: []const u8,
     ptype: PluckType,
@@ -22,6 +23,7 @@ pub const Config = struct {
     groups: []ConditionGroup,
     pluck: []PluckField,
     format: OutputFormat = .tsv,
+    limit: ?usize = null,
 };
 
 pub fn main() !void {
@@ -37,9 +39,10 @@ pub fn main() !void {
         
         const msg = switch (err) {
             error.MissingFileValue => "Error: --file requires a path argument.",
+            error.MissingLimitValue => "Error: --limit requires a number.",
             error.MissingFormatValue => "Error: --format requires 'json', 'csv', or 'tsv'.",
             error.InvalidCondition => "Error: Incomplete WHERE condition. Use <key> <op> <val>.",
-            error.UnknownOperator => "Error: Invalid operator. Supported: eq, neq, gt, lt, gte, lte, has.",
+            error.UnknownOperator => "Error: Invalid operator. Supported: eq, neq, gt, lt, gte, lte, has, exists.",
             error.MissingArguments => "Error: No query provided. You must provide a search condition or a SELECT clause.",
             else => "Error parsing arguments.",
         };
@@ -101,6 +104,7 @@ fn parseOp(op_str: []const u8) ?Operator {
     if (std.ascii.eqlIgnoreCase(op_str, "gte")) return .gte;
     if (std.ascii.eqlIgnoreCase(op_str, "lte")) return .lte;
     if (std.ascii.eqlIgnoreCase(op_str, "has")) return .has;
+    if (std.ascii.eqlIgnoreCase(op_str, "exists")) return .exists;
     return null;
 }
 
@@ -115,6 +119,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--file")) {
             config.file_path = try allocator.dupe(u8, args.next() orelse return error.MissingFileValue);
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            const lim_str = args.next() orelse return error.MissingLimitValue;
+            config.limit = try std.fmt.parseInt(usize, lim_str, 10);
         } else if (std.mem.eql(u8, arg, "--format")) {
             const fmt_str = args.next() orelse return error.MissingFormatValue;
             if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv
@@ -154,6 +161,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     } else if (std.ascii.startsWithIgnoreCase(p, "max:")) {
                         ptype = .max;
                         key = p[4..];
+                    } else if (std.ascii.startsWithIgnoreCase(p, "avg:")) {
+                        ptype = .avg;
+                        key = p[4..];
                     } 
                     
                     try pluck_keys.append(.{ .key = key, .ptype = ptype, .original_str = p });
@@ -173,13 +183,30 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 
     var groups = std.ArrayList(ConditionGroup).init(allocator);
     var current_conditions = std.ArrayList(Condition).init(allocator);
+    var negated = false;
     while (i < tokens.items.len) {
-        if (i + 2 >= tokens.items.len) return error.InvalidCondition;
+        if (std.ascii.eqlIgnoreCase(tokens.items[i], "not")) {
+            negated = true;
+            i += 1;
+            continue;
+        }
+
+        if (i + 1 >= tokens.items.len) return error.InvalidCondition;
         const key = tokens.items[i];
         const op = parseOp(tokens.items[i+1]) orelse return error.UnknownOperator;
-        const val = tokens.items[i+2];
-        i += 3;
-        try current_conditions.append(.{ .key = key, .val = val, .op = op });
+        var val: []const u8 = "";
+        
+        if (op != .exists) {
+            if (i + 2 >= tokens.items.len) return error.InvalidCondition;
+            val = tokens.items[i+2];
+            i += 3;
+        } else {
+            i += 2;
+        }
+
+        try current_conditions.append(.{ .key = key, .val = val, .op = op, .negated = negated });
+        negated = false;
+
         if (i < tokens.items.len) {
             const logical = tokens.items[i];
             i += 1;

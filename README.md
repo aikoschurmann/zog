@@ -45,10 +45,10 @@ All examples below use this `demo.jsonl` file:
 ### Basic Syntax
 
 ```bash
-zog [--file <path>] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
+zog [--file <path>] [--limit <number>] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
 ```
 
-**Operators:** `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `has`
+**Operators:** `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `has`, `exists`
 
 **Type Prefixes:** `s:` (string), `n:` (numeric/primitive), `b:` (boolean/primitive - alias for `n:`)
 
@@ -82,6 +82,15 @@ zog --file demo.jsonl age eq 30 AND tier gt 2
 ```bash
 zog --file demo.jsonl tier eq 1 OR tier eq 5
 # {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Eve", "age": "45", "balance": "99.99", "active": "true", "tier": 5}
+```
+
+**NOT** - Negate a condition:
+
+```bash
+zog --file demo.jsonl NOT age eq 30
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Dave", "age": 45, "balance": 5000.00, "active": true, "tier": 4}
 # {"name": "Eve", "age": "45", "balance": "99.99", "active": "true", "tier": 5}
 ```
 
@@ -142,6 +151,11 @@ zog --file demo.jsonl age neq 30
 # {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
 # {"name": "Dave", "age": 45, "balance": 5000.00, "active": true, "tier": 4}
 # {"name": "Eve", "age": "45", "balance": "99.99", "active": "true", "tier": 5}
+
+# Exists
+zog --file demo.jsonl balance exists
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# ...
 ```
 
 ### Substring Matching
@@ -180,6 +194,7 @@ zog can compute aggregations over matching records at near line-speed (~2 GB/s):
 - `sum:field` - Sum numeric values
 - `min:field` - Find minimum value
 - `max:field` - Find maximum value
+- `avg:field` - Find average value
 
 **Syntax:** zog supports shell-safe colon syntax (`count:field`). The colon syntax avoids shell escaping issues.
 
@@ -215,8 +230,13 @@ zog --file demo.jsonl SELECT count:name WHERE tier gte 2
 # Output: 4
 
 # Multiple aggregations
-zog --file demo.jsonl SELECT count:name,sum:balance,min:age,max:tier WHERE active eq true
-# Output: 4    5200.4900    25.0000    5.0000
+zog --file demo.jsonl SELECT count:name,sum:balance,avg:age,min:age,max:tier WHERE active eq true
+# Output: 4    5200.4900    32.5000    25.0000    5.0000
+
+# Limit results
+zog --file demo.jsonl --limit 2 active eq true
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
 
 # Total balance across all records (no WHERE clause needed)
 cat demo.jsonl | zog SELECT sum:balance

@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const BLOCK_SIZE = 8 * 1024 * 1024;
 const VECTOR_LEN = 32;
 const V = @Vector(VECTOR_LEN, u8);
+const QUOTE_VEC: V = @splat('"');
 
 const TypeForced = enum { none, string, numeric };
 
@@ -16,6 +17,8 @@ const CompiledCondition = struct {
     val_i64: ?i64,
     op: main.Operator,
     type_forced: TypeForced,
+    negated: bool,
+    fcv: V,
 };
 
 const CompiledGroup = struct { conditions: []CompiledCondition };
@@ -31,6 +34,7 @@ const CompiledPlan = struct {
     pluck: []CompiledPluck,
     has_aggregations: bool,
     format: main.OutputFormat,
+    limit: ?usize,
 };
 
 const AggState = union(enum) {
@@ -39,6 +43,7 @@ const AggState = union(enum) {
     sum: f64,
     min: f64,
     max: f64,
+    avg: struct { sum: f64, count: usize },
 };
 
 const Buffer = struct { 
@@ -106,6 +111,8 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
                 .val_i64 = std.fmt.parseInt(i64, actual_val, 10) catch null,
                 .op = c.op,
                 .type_forced = type_forced,
+                .negated = c.negated,
+                .fcv = @splat(key_q[1]),
             };
         }
         comp_groups[i] = .{ .conditions = comp_conds };
@@ -127,69 +134,73 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
         .pluck = pks, 
         .has_aggregations = has_aggs,
         .format = config.format,
+        .limit = config.limit,
     };
 }
 
 inline fn evaluateValue(rest_si: []const u8, cond: CompiledCondition) bool {
     const is_json_string = rest_si.len > 0 and rest_si[0] == '"';
 
-    if (cond.op == .eq or cond.op == .neq) {
-        var is_match = false;
-        if (is_json_string) {
-            if (cond.type_forced != .numeric) {
-                if (std.mem.startsWith(u8, rest_si, cond.val_quoted)) is_match = true;
-            }
-        } else {
-            if (cond.type_forced != .string) {
-                if (std.mem.startsWith(u8, rest_si, cond.val_unquoted)) {
-                    const me = cond.val_unquoted.len;
-                    if (me == rest_si.len or isPrimitiveTerminator(rest_si[me])) is_match = true;
+    switch (cond.op) {
+        .eq, .neq => {
+            var is_match = false;
+            if (is_json_string) {
+                if (cond.type_forced != .numeric) {
+                    if (std.mem.startsWith(u8, rest_si, cond.val_quoted)) is_match = true;
+                }
+            } else {
+                if (cond.type_forced != .string) {
+                    if (std.mem.startsWith(u8, rest_si, cond.val_unquoted)) {
+                        const me = cond.val_unquoted.len;
+                        if (me == rest_si.len or isPrimitiveTerminator(rest_si[me])) is_match = true;
+                    }
                 }
             }
-        }
-        return if (cond.op == .eq) is_match else !is_match;
-    } 
-
-    if (cond.op == .has) {
-        if (extractValueFromRest(rest_si)) |extracted|
-            return std.mem.indexOf(u8, extracted, cond.val_unquoted) != null;
-        return false;
-    }
-
-    if (cond.val_f64) |target_f64| {
-        if (cond.type_forced == .string and !is_json_string) return false;
-        if (cond.type_forced == .numeric and is_json_string) return false;
-        
-        if (extractValueFromRest(rest_si)) |extracted| {
-            if (cond.val_i64) |target_i64| {
-                if (parseFastInt(extracted)) |parsed_i64| {
-                    return switch (cond.op) { 
-                        .gt => parsed_i64 > target_i64, 
-                        .lt => parsed_i64 < target_i64, 
-                        .gte => parsed_i64 >= target_i64, 
-                        .lte => parsed_i64 <= target_i64, 
-                        else => false 
-                    };
+            return if (cond.op == .eq) is_match else !is_match;
+        },
+        .has => {
+            if (extractValueFromRest(rest_si)) |extracted|
+                return std.mem.indexOf(u8, extracted, cond.val_unquoted) != null;
+            return false;
+        },
+        .exists => return true,
+        .gt, .lt, .gte, .lte => {
+            if (cond.val_f64) |target_f64| {
+                if (cond.type_forced == .string and !is_json_string) return false;
+                if (cond.type_forced == .numeric and is_json_string) return false;
+                
+                if (extractValueFromRest(rest_si)) |extracted| {
+                    if (cond.val_i64) |target_i64| {
+                        if (parseFastInt(extracted)) |parsed_i64| {
+                            return switch (cond.op) { 
+                                .gt => parsed_i64 > target_i64, 
+                                .lt => parsed_i64 < target_i64, 
+                                .gte => parsed_i64 >= target_i64, 
+                                .lte => parsed_i64 <= target_i64, 
+                                else => unreachable 
+                            };
+                        }
+                    }
+                    if (std.fmt.parseFloat(f64, extracted)) |parsed_f64| {
+                        return switch (cond.op) { 
+                            .gt => parsed_f64 > target_f64, 
+                            .lt => parsed_f64 < target_f64, 
+                            .gte => parsed_f64 >= target_f64, 
+                            .lte => parsed_f64 <= target_f64, 
+                            else => unreachable 
+                        };
+                    } else |_| {}
                 }
             }
-            if (std.fmt.parseFloat(f64, extracted)) |parsed_f64| {
-                return switch (cond.op) { 
-                    .gt => parsed_f64 > target_f64, 
-                    .lt => parsed_f64 < target_f64, 
-                    .gte => parsed_f64 >= target_f64, 
-                    .lte => parsed_f64 <= target_f64, 
-                    else => false 
-                };
-            } else |_| {}
-        }
+            return false;
+        },
     }
-    return false;
 }
 
-inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, quote_vec: V, first_char_vec: V, i: usize) bool {
+inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, i: usize) bool {
     const chunk: V = line[i..][0..VECTOR_LEN].*;
     const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
-    const matches_mask = @as(u32, @bitCast(chunk == quote_vec)) & @as(u32, @bitCast(next_chunk == first_char_vec));
+    const matches_mask = @as(u32, @bitCast(chunk == QUOTE_VEC)) & @as(u32, @bitCast(next_chunk == cond.fcv));
 
     if (matches_mask != 0) {
         var mask = matches_mask;
@@ -198,6 +209,7 @@ inline fn checkSimdChunk(line: []const u8, cond: CompiledCondition, quote_vec: V
             const pos = i + bit_pos;
             if (line.len - pos >= cond.key_quoted.len) {
                 if (std.mem.eql(u8, line[pos + 2 .. pos + cond.key_quoted.len], cond.key_quoted[2..])) {
+                    if (cond.op == .exists) return true;
                     const rest = line[pos + cond.key_quoted.len..];
                     var si: usize = 0;
                     while (si < rest.len and (rest[si] == ' ' or rest[si] == '\t' or rest[si] == ':')) : (si += 1) {}
@@ -216,37 +228,52 @@ fn lineMatches(line: []const u8, cond: CompiledCondition) bool {
     if (line.len < 2) return false;
     if (line.len < VECTOR_LEN + 1) {
         var j: usize = 0;
-        while (j + cond.key_quoted.len <= line.len) : (j += 1) {
-            if (line[j] == '"' and line[j+1] == cond.key_quoted[1]) {
-                if (std.mem.eql(u8, line[j + 2 .. j + cond.key_quoted.len], cond.key_quoted[2..])) {
-                    const rest = line[j + cond.key_quoted.len..];
+        const key = cond.key_quoted;
+        while (std.mem.indexOfScalarPos(u8, line, j, '"')) |kp| {
+            if (kp + key.len <= line.len and line[kp+1] == key[1]) {
+                if (std.mem.eql(u8, line[kp + 2 .. kp + key.len], key[2..])) {
+                    if (cond.op == .exists) return true;
+                    const rest = line[kp + key.len..];
                     var si: usize = 0;
                     while (si < rest.len and (rest[si] == ' ' or rest[si] == '\t' or rest[si] == ':')) : (si += 1) {}
                     if (si < rest.len) { if (evaluateValue(rest[si..], cond)) return true; }
                 }
             }
+            j = kp + 1;
         }
         return false;
     }
 
-    const qv: V = @splat('"');
-    const fcv: V = @splat(cond.key_quoted[1]);
     var i: usize = 0;
     while (i + VECTOR_LEN + 1 <= line.len) {
-        if (checkSimdChunk(line, cond, qv, fcv, i)) return true;
+        if (checkSimdChunk(line, cond, i)) return true;
         i += VECTOR_LEN;
     }
     const tail_i = line.len - VECTOR_LEN - 1;
-    return checkSimdChunk(line, cond, qv, fcv, tail_i);
+    return checkSimdChunk(line, cond, tail_i);
 }
 
 inline fn evaluatePlan(line: []const u8, plan: CompiledPlan) bool {
     if (plan.groups.len == 0) return true;
     if (line.len < 2) return false;
 
+    // Fast path: Single group with single condition (the 95% case)
+    if (plan.groups.len == 1 and plan.groups[0].conditions.len == 1) {
+        const cond = plan.groups[0].conditions[0];
+        const matches = lineMatches(line, cond);
+        return if (cond.negated) !matches else matches;
+    }
+
     for (plan.groups) |group| {
         var gm = true;
-        for (group.conditions) |cond| { if (!lineMatches(line, cond)) { gm = false; break; } }
+        for (group.conditions) |cond| { 
+            const matches = lineMatches(line, cond);
+            if (cond.negated) {
+                if (matches) { gm = false; break; }
+            } else {
+                if (!matches) { gm = false; break; }
+            }
+        }
         if (gm) return true;
     }
     return false;
@@ -408,6 +435,7 @@ fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck
                 .sum => |s| try writer.print("{d:.4}", .{s}),
                 .min => |m| if (m == std.math.inf(f64)) try writer.print("null", .{}) else try writer.print("{d:.4}", .{m}),
                 .max => |m| if (m == -std.math.inf(f64)) try writer.print("null", .{}) else try writer.print("{d:.4}", .{m}),
+                .avg => |a| if (a.count == 0) try writer.print("null", .{}) else try writer.print("{d:.4}", .{a.sum / @as(f64, @floatFromInt(a.count))}),
             }
         }
         try writer.print("}}\n", .{});
@@ -419,6 +447,7 @@ fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck
                 .sum => |s| try writer.print("{d:.4}", .{s}),
                 .min => |m| if (m == std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
                 .max => |m| if (m == -std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
+                .avg => |a| if (a.count > 0) try writer.print("{d:.4}", .{a.sum / @as(f64, @floatFromInt(a.count))}),
             }
             if (i < agg_states.len - 1) try writer.print(",", .{});
         }
@@ -431,6 +460,7 @@ fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck
                 .sum => |s| try writer.print("{d:.4}", .{s}),
                 .min => |m| if (m == std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
                 .max => |m| if (m == -std.math.inf(f64)) {} else try writer.print("{d:.4}", .{m}),
+                .avg => |a| if (a.count > 0) try writer.print("{d:.4}", .{a.sum / @as(f64, @floatFromInt(a.count))}),
             }
             if (i < agg_states.len - 1) try writer.print("\t", .{});
         }
@@ -441,7 +471,8 @@ fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck
 fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, writer: anytype) !void {
     const pluck_keys = plan.pluck;
     if (pluck_keys.len == 0) {
-        try writer.print("{s}\n", .{line});
+        try writer.writeAll(line);
+        try writer.writeByte('\n');
         return;
     }
 
@@ -503,6 +534,7 @@ fn handleMatch(line: []const u8, plan: CompiledPlan, agg_states: []AggState, wri
                     .sum => { if (std.fmt.parseFloat(f64, val)) |f| agg_states[i].sum += f else |_| {} },
                     .min => { if (std.fmt.parseFloat(f64, val)) |f| agg_states[i].min = @min(agg_states[i].min, f) else |_| {} },
                     .max => { if (std.fmt.parseFloat(f64, val)) |f| agg_states[i].max = @max(agg_states[i].max, f) else |_| {} },
+                    .avg => { if (std.fmt.parseFloat(f64, val)) |f| { agg_states[i].avg.sum += f; agg_states[i].avg.count += 1; } else |_| {} },
                 }
             }
         }
@@ -557,6 +589,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
             .sum => .{ .sum = 0.0 },
             .min => .{ .min = std.math.inf(f64) },
             .max => .{ .max = -std.math.inf(f64) },
+            .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
         };
     }
 
@@ -569,6 +602,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
     
     const thread = try std.Thread.spawn(.{}, readerThread, .{&ctx});
     var consume_idx: usize = 0;
+    var match_count: usize = 0;
     
     while (true) {
         fill_sem.wait();
@@ -587,27 +621,41 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
                 while (iter != 0) {
                     const nl_pos = @ctz(iter);
                     const line = data[sol .. i + nl_pos];
-                    if (evaluatePlan(line, plan)) try handleMatch(line, plan, agg_states, writer);
+                    if (evaluatePlan(line, plan)) {
+                        try handleMatch(line, plan, agg_states, writer);
+                        match_count += 1;
+                        if (plan.limit) |l| { if (match_count >= l) { ctx.done.store(true, .release); break; } }
+                    }
                     sol = i + nl_pos + 1;
                     iter &= iter - 1;
                 }
             }
+            if (plan.limit) |l| { if (match_count >= l) break; }
         }
         while (sol < data.len) {
             if (std.mem.indexOfScalar(u8, data[sol..], '\n')) |nl_pos| {
                 const line = data[sol .. sol + nl_pos];
-                if (evaluatePlan(line, plan)) try handleMatch(line, plan, agg_states, writer);
+                if (evaluatePlan(line, plan)) {
+                    try handleMatch(line, plan, agg_states, writer);
+                    match_count += 1;
+                    if (plan.limit) |l| { if (match_count >= l) { ctx.done.store(true, .release); break; } }
+                }
                 sol += nl_pos + 1;
             } else break;
         }
-        if (ctx.done.load(.acquire) and sol < data.len) {
+        if (ctx.done.load(.acquire) and sol < data.len and (plan.limit == null or match_count < plan.limit.?)) {
             const line = std.mem.trimRight(u8, data[sol..], "\r\n");
-            if (line.len > 0 and evaluatePlan(line, plan)) try handleMatch(line, plan, agg_states, writer);
+            if (line.len > 0 and evaluatePlan(line, plan)) {
+                try handleMatch(line, plan, agg_states, writer);
+                match_count += 1;
+                if (plan.limit) |l| { if (match_count >= l) { ctx.done.store(true, .release); break; } }
+            }
             sol = data.len;
         }
         consume_idx = 1 - consume_idx;
         read_sem.post();
         if (ctx.done.load(.acquire) and fill_sem.permits == 0) break;
+        if (plan.limit) |l| { if (match_count >= l) break; }
     }
     thread.join();
 
