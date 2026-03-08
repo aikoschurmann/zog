@@ -1,7 +1,11 @@
 const std = @import("std");
 const Scanner = @import("scanner.zig");
 
-pub const Operator = enum { eq, neq, gt, lt, gte, lte, has, exists };
+pub const VERSION = "0.3.0";
+
+pub const MAX_PLUCK_FIELDS = 256;
+
+pub const Operator = enum { eq, neq, gt, lt, gte, lte, has, exists, in_op };
 pub const Condition = struct {
     key: []const u8,
     val: []const u8,
@@ -24,6 +28,8 @@ pub const Config = struct {
     pluck: []PluckField,
     format: OutputFormat = .tsv,
     limit: ?usize = null,
+    count_only: bool = false,
+    header: bool = false,
 };
 
 pub fn main() !void {
@@ -42,8 +48,9 @@ pub fn main() !void {
             error.MissingLimitValue => "Error: --limit requires a number.",
             error.MissingFormatValue => "Error: --format requires 'json', 'csv', or 'tsv'.",
             error.InvalidCondition => "Error: Incomplete WHERE condition. Use <key> <op> <val>.",
-            error.UnknownOperator => "Error: Invalid operator. Supported: eq, neq, gt, lt, gte, lte, has, exists.",
+            error.UnknownOperator => "Error: Invalid operator. Supported: eq, neq, gt, lt, gte, lte, has, exists, in.",
             error.MissingArguments => "Error: No query provided. You must provide a search condition or a SELECT clause.",
+            error.TooManyPluckFields => "Error: Too many SELECT fields (max 256).",
             else => "Error parsing arguments.",
         };
         std.debug.print("{s}\n\n", .{msg});
@@ -63,12 +70,15 @@ pub fn main() !void {
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.BufferedWriter(128 * 1024, @TypeOf(stdout_file)){ .unbuffered_writer = stdout_file };
     const stdout = bw.writer();
-    defer bw.flush() catch {};
 
     if (config.file_path) |_| {
-        try Scanner.searchFile(allocator, config, stdout);
+        const matched = try Scanner.searchFile(allocator, config, stdout);
+        bw.flush() catch {};
+        if (matched == 0) std.process.exit(1);
     } else {
-        try Scanner.searchStream(allocator, config, stdout);
+        const matched = try Scanner.searchStream(allocator, config, stdout);
+        bw.flush() catch {};
+        if (matched == 0) std.process.exit(1);
     }
 }
 
@@ -81,16 +91,25 @@ fn printUsage() void {
         \\Options:
         \\  --file <path>       Path to JSONL file (reads from stdin if omitted)
         \\  --format <type>     Output format: tsv (default), csv, or json
+        \\  --count, -c         Print only the count of matching lines
+        \\  --header            Print column header row (for TSV/CSV with SELECT)
+        \\  --limit <n>         Stop after n matches
         \\  --help, -h          Show this help message
         \\  --version, -v       Show version
         \\
         \\Query Syntax:
-        \\  Operators: eq, neq, gt, lt, gte, lte, has
+        \\  Operators: eq, neq, gt, lt, gte, lte, has, exists, in
         \\  Types: Auto-detected. Use 's:' for strings or 'n:' for numbers to force types.
-        \\  Aggregations: count:field, sum:field, min:field, max:field
+        \\  Aggregations: count:field, sum:field, min:field, max:field, avg:field
+        \\
+        \\Exit Codes:
+        \\  0  At least one match found
+        \\  1  No matches found
         \\
         \\Examples:
         \\  zog --file logs.jsonl level eq error
+        \\  zog --file logs.jsonl level in error,critical,warn
+        \\  zog --file data.jsonl SELECT name,age
         \\  cat data.jsonl | zog SELECT name,sum:balance WHERE active eq b:true
         \\
     , .{});
@@ -105,6 +124,7 @@ fn parseOp(op_str: []const u8) ?Operator {
     if (std.ascii.eqlIgnoreCase(op_str, "lte")) return .lte;
     if (std.ascii.eqlIgnoreCase(op_str, "has")) return .has;
     if (std.ascii.eqlIgnoreCase(op_str, "exists")) return .exists;
+    if (std.ascii.eqlIgnoreCase(op_str, "in")) return .in_op;
     return null;
 }
 
@@ -130,8 +150,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            std.debug.print("zog v0.2.1\n", .{});
+            std.debug.print("zog v{s}\n", .{VERSION});
             std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
+            config.count_only = true;
+        } else if (std.mem.eql(u8, arg, "--header")) {
+            config.header = true;
         } else {
             try tokens.append(try allocator.dupe(u8, arg));
         }
@@ -180,6 +204,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         }
     }
     config.pluck = try pluck_keys.toOwnedSlice();
+    if (config.pluck.len > MAX_PLUCK_FIELDS) return error.TooManyPluckFields;
 
     var groups = std.ArrayList(ConditionGroup).init(allocator);
     var current_conditions = std.ArrayList(Condition).init(allocator);
@@ -223,7 +248,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     if (current_conditions.items.len > 0) try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
     config.groups = try groups.toOwnedSlice();
     
-    // Ensure that some action (either filtering or plucking) was requested
-    if (config.groups.len == 0 and config.pluck.len == 0) return error.MissingArguments;
+    // Ensure that some action (either filtering, plucking, or counting) was requested
+    if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) return error.MissingArguments;
     return config;
 }

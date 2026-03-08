@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     const scanner_tests = b.addTest(.{
-        .root_source_file = b.path("src/Scanner.zig"),
+        .root_source_file = b.path("src/scanner.zig"),
         .target = target,
         .optimize = optimize,
     });

@@ -45,10 +45,10 @@ All examples below use this `demo.jsonl` file:
 ### Basic Syntax
 
 ```bash
-zog [--file <path>] [--limit <number>] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
+zog [--file <path>] [--limit <number>] [--count] [--header] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
 ```
 
-**Operators:** `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `has`, `exists`
+**Operators:** `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `has`, `exists`, `in`
 
 **Type Prefixes:** `s:` (string), `n:` (numeric/primitive), `b:` (boolean/primitive - alias for `n:`)
 
@@ -169,6 +169,21 @@ zog --file demo.jsonl name has li
 # {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
 ```
 
+### Multi-Value Matching (IN)
+
+Use the `in` operator to match a field against multiple values at once:
+
+```bash
+# Find entries where tier is 1, 3, or 5
+zog --file demo.jsonl tier in 1,3,5
+# {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
+# {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
+# {"name": "Eve", "age": "45", "balance": "99.99", "active": "true", "tier": 5}
+
+# Match multiple string values
+zog --file logs.jsonl level in error,critical,warn
+```
+
 ### Field Extraction (SELECT)
 
 Extract specific fields instead of printing entire JSONL lines:
@@ -183,6 +198,25 @@ zog --file demo.jsonl SELECT name,tier WHERE balance lt 100
 Bob     2
 Charlie 3
 Eve     5
+```
+
+**Bare SELECT (no WHERE):** Extract fields from every line without filtering:
+
+```bash
+zog --file demo.jsonl --limit 3 SELECT name,age
+# Alice   25
+# Bob     30
+# Charlie 30
+```
+
+**Column Headers:** Use `--header` to print a header row with field names:
+
+```bash
+zog --file demo.jsonl --header SELECT name,tier WHERE balance lt 100
+# name    tier
+# Bob     2
+# Charlie 3
+# Eve     5
 ```
 
 ### Aggregations
@@ -237,6 +271,14 @@ zog --file demo.jsonl SELECT count:name,sum:balance,avg:age,min:age,max:tier WHE
 zog --file demo.jsonl --limit 2 active eq true
 # {"name": "Alice", "age": 25, "balance": 100.50, "active": true, "tier": 1}
 # {"name": "Charlie", "age": 30, "balance": 0.0, "active": true, "tier": 3}
+
+# Count matching lines (without printing them)
+zog --file demo.jsonl --count active eq true
+# 3
+
+# Short flag -c
+zog --file demo.jsonl -c tier gte 2
+# 4
 
 # Total balance across all records (no WHERE clause needed)
 cat demo.jsonl | zog SELECT sum:balance
@@ -332,6 +374,11 @@ tail -f app.jsonl | zog level eq error
 
 # Chain with other tools
 cat large_data.jsonl | zog status gte 500 | wc -l
+
+# Use exit codes in scripts (0 = match found, 1 = no matches)
+if zog --file logs.jsonl level eq error > /dev/null 2>&1; then
+  echo "Errors found!"
+fi
 
 # Extract and process
 zog --file demo.jsonl SELECT name WHERE tier gte 3 | sort
