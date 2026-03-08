@@ -1,7 +1,7 @@
 const std = @import("std");
 const Scanner = @import("scanner.zig");
 
-pub const VERSION = "0.3.0";
+pub const VERSION = "0.1.5";
 
 pub const MAX_PLUCK_FIELDS = 256;
 
