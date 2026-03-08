@@ -34,7 +34,7 @@ pub const Config = struct {
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) std.debug.print("warning: memory leak detected\n", .{});
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
@@ -51,6 +51,7 @@ pub fn main() !void {
             error.UnknownOperator => "Error: Invalid operator. Supported: eq, neq, gt, lt, gte, lte, has, exists, in.",
             error.MissingArguments => "Error: No query provided. You must provide a search condition or a SELECT clause.",
             error.TooManyPluckFields => "Error: Too many SELECT fields (max 256).",
+            error.InvalidFormat => "Error: --format must be 'json', 'csv', or 'tsv'.",
             else => "Error parsing arguments.",
         };
         std.debug.print("{s}\n\n", .{msg});
@@ -63,6 +64,7 @@ pub fn main() !void {
         if (std.io.getStdIn().isTty()) {
             std.debug.print("Error: No input file specified and no data piped to stdin.\n", .{});
             std.debug.print("Provide a file with '--file <path>' or pipe data: 'cat logs.jsonl | zog ...'\n", .{});
+            std.debug.print("Run 'zog --help' for usage information.\n", .{});
             std.process.exit(1);
         }
     }
@@ -99,7 +101,10 @@ fn printUsage() void {
         \\
         \\Query Syntax:
         \\  Operators: eq, neq, gt, lt, gte, lte, has, exists, in
-        \\  Types: Auto-detected. Use 's:' for strings or 'n:' for numbers to force types.
+        \\  Types:     Auto-detected. Use 's:' for strings or 'n:' for numbers to force types.
+        \\  NOT:       Negate any condition with NOT before the key  (e.g. NOT level eq debug)
+        \\  exists:    Check key presence only, no value needed       (e.g. error exists)
+        \\  AND / OR:  Chain conditions                               (e.g. level eq error AND code gt 500)
         \\  Aggregations: count:field, sum:field, min:field, max:field, avg:field
         \\
         \\Exit Codes:
@@ -128,11 +133,103 @@ fn parseOp(op_str: []const u8) ?Operator {
     return null;
 }
 
+fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) !struct { fields: []PluckField, next_i: usize } {
+    var pluck_keys = std.ArrayList(PluckField).init(allocator);
+    var i = start;
+    const select_start_idx = i;
+
+    while (i < tokens.len and !std.ascii.eqlIgnoreCase(tokens[i], "where")) {
+        var it = std.mem.splitScalar(u8, tokens[i], ',');
+        while (it.next()) |p| {
+            if (p.len > 0) {
+                var ptype: PluckType = .raw;
+                var key = p;
+
+                if (std.ascii.startsWithIgnoreCase(p, "count:")) {
+                    ptype = .count;
+                    key = p[6..];
+                } else if (std.ascii.startsWithIgnoreCase(p, "sum:")) {
+                    ptype = .sum;
+                    key = p[4..];
+                } else if (std.ascii.startsWithIgnoreCase(p, "min:")) {
+                    ptype = .min;
+                    key = p[4..];
+                } else if (std.ascii.startsWithIgnoreCase(p, "max:")) {
+                    ptype = .max;
+                    key = p[4..];
+                } else if (std.ascii.startsWithIgnoreCase(p, "avg:")) {
+                    ptype = .avg;
+                    key = p[4..];
+                }
+
+                try pluck_keys.append(.{ .key = key, .ptype = ptype, .original_str = p });
+            }
+        }
+        i += 1;
+    }
+
+    // SELECT was present but no fields were listed before WHERE / end of input
+    if (i == select_start_idx) return error.MissingArguments;
+
+    // Consume the optional WHERE keyword
+    if (i < tokens.len and std.ascii.eqlIgnoreCase(tokens[i], "where")) i += 1;
+
+    const fields = try pluck_keys.toOwnedSlice();
+    if (fields.len > MAX_PLUCK_FIELDS) return error.TooManyPluckFields;
+    return .{ .fields = fields, .next_i = i };
+}
+
+fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
+    var groups = std.ArrayList(ConditionGroup).init(allocator);
+    var current_conditions = std.ArrayList(Condition).init(allocator);
+    var negated = false;
+    var i = start;
+
+    while (i < tokens.len) {
+        if (std.ascii.eqlIgnoreCase(tokens[i], "not")) {
+            negated = true;
+            i += 1;
+            continue;
+        }
+
+        if (i + 1 >= tokens.len) return error.InvalidCondition;
+        const key = tokens[i];
+        const op = parseOp(tokens[i + 1]) orelse return error.UnknownOperator;
+        var val: []const u8 = "";
+
+        if (op != .exists) {
+            if (i + 2 >= tokens.len) return error.InvalidCondition;
+            val = tokens[i + 2];
+            i += 3;
+        } else {
+            i += 2;
+        }
+
+        try current_conditions.append(.{ .key = key, .val = val, .op = op, .negated = negated });
+        negated = false;
+
+        if (i < tokens.len) {
+            const logical = tokens[i];
+            i += 1;
+            if (std.ascii.eqlIgnoreCase(logical, "or")) {
+                try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
+                current_conditions = std.ArrayList(Condition).init(allocator);
+            } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
+                return error.InvalidCondition;
+            }
+        }
+    }
+
+    if (current_conditions.items.len > 0) try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
+    return groups.toOwnedSlice();
+}
+
 fn parseArgs(allocator: std.mem.Allocator) !Config {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.skip();
 
+    // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
     var tokens = std.ArrayList([]const u8).init(allocator);
     var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
 
@@ -146,11 +243,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             const fmt_str = args.next() orelse return error.MissingFormatValue;
             if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv
             else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json
-            else config.format = .tsv;
+            else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv
+            else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            std.debug.print("zog v{s}\n", .{VERSION});
+            std.io.getStdOut().writer().print("zog v{s}\n", .{VERSION}) catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;
@@ -162,93 +260,17 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     }
 
     var i: usize = 0;
-    var pluck_keys = std.ArrayList(PluckField).init(allocator);
+
     if (i < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[i], "select")) {
         i += 1;
-        const select_start_idx = i;
-        while (i < tokens.items.len and !std.ascii.eqlIgnoreCase(tokens.items[i], "where")) {
-            var it = std.mem.splitScalar(u8, tokens.items[i], ',');
-            while (it.next()) |p| { 
-                if (p.len > 0) {
-                    var ptype: PluckType = .raw;
-                    var key = p;
-                    
-                    if (std.ascii.startsWithIgnoreCase(p, "count:")) {
-                        ptype = .count;
-                        key = p[6..];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "sum:")) {
-                        ptype = .sum;
-                        key = p[4..];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "min:")) {
-                        ptype = .min;
-                        key = p[4..];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "max:")) {
-                        ptype = .max;
-                        key = p[4..];
-                    } else if (std.ascii.startsWithIgnoreCase(p, "avg:")) {
-                        ptype = .avg;
-                        key = p[4..];
-                    } 
-                    
-                    try pluck_keys.append(.{ .key = key, .ptype = ptype, .original_str = p });
-                }
-            }
-            i += 1;
-        }
-        
-        // Error if SELECT was used but no fields were provided before WHERE or end of string
-        if (i == select_start_idx) return error.MissingArguments;
-
-        if (i < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[i], "where")) {
-            i += 1;
-        }
-    }
-    config.pluck = try pluck_keys.toOwnedSlice();
-    if (config.pluck.len > MAX_PLUCK_FIELDS) return error.TooManyPluckFields;
-
-    var groups = std.ArrayList(ConditionGroup).init(allocator);
-    var current_conditions = std.ArrayList(Condition).init(allocator);
-    var negated = false;
-    while (i < tokens.items.len) {
-        if (std.ascii.eqlIgnoreCase(tokens.items[i], "not")) {
-            negated = true;
-            i += 1;
-            continue;
-        }
-
-        if (i + 1 >= tokens.items.len) return error.InvalidCondition;
-        const key = tokens.items[i];
-        const op = parseOp(tokens.items[i+1]) orelse return error.UnknownOperator;
-        var val: []const u8 = "";
-        
-        if (op != .exists) {
-            if (i + 2 >= tokens.items.len) return error.InvalidCondition;
-            val = tokens.items[i+2];
-            i += 3;
-        } else {
-            i += 2;
-        }
-
-        try current_conditions.append(.{ .key = key, .val = val, .op = op, .negated = negated });
-        negated = false;
-
-        if (i < tokens.items.len) {
-            const logical = tokens.items[i];
-            i += 1;
-            if (std.ascii.eqlIgnoreCase(logical, "or")) {
-                try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
-                current_conditions = std.ArrayList(Condition).init(allocator);
-            } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
-                // If it's not AND/OR, the query structure is invalid
-                return error.InvalidCondition;
-            }
-        }
+        const result = try parseSelectClause(allocator, tokens.items, i);
+        config.pluck = result.fields;
+        i = result.next_i;
     }
 
-    if (current_conditions.items.len > 0) try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
-    config.groups = try groups.toOwnedSlice();
-    
-    // Ensure that some action (either filtering, plucking, or counting) was requested
+    config.groups = try parseWhereClause(allocator, tokens.items, i);
+
+    // Ensure that some action (filtering, plucking, or counting) was requested
     if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) return error.MissingArguments;
     return config;
 }
