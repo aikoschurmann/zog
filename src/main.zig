@@ -33,7 +33,7 @@ pub const Config = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) std.debug.print("warning: memory leak detected\n", .{});
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
@@ -134,7 +134,7 @@ fn parseOp(op_str: []const u8) ?Operator {
 }
 
 fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) !struct { fields: []PluckField, next_i: usize } {
-    var pluck_keys = std.ArrayList(PluckField).init(allocator);
+    var pluck_keys: std.ArrayListUnmanaged(PluckField) = .empty;
     var i = start;
     const select_start_idx = i;
 
@@ -162,7 +162,7 @@ fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, s
                     key = p[4..];
                 }
 
-                try pluck_keys.append(.{ .key = key, .ptype = ptype, .original_str = p });
+                try pluck_keys.append(allocator, .{ .key = key, .ptype = ptype, .original_str = p });
             }
         }
         i += 1;
@@ -174,14 +174,14 @@ fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, s
     // Consume the optional WHERE keyword
     if (i < tokens.len and std.ascii.eqlIgnoreCase(tokens[i], "where")) i += 1;
 
-    const fields = try pluck_keys.toOwnedSlice();
+    const fields = try pluck_keys.toOwnedSlice(allocator);
     if (fields.len > MAX_PLUCK_FIELDS) return error.TooManyPluckFields;
     return .{ .fields = fields, .next_i = i };
 }
 
 fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
-    var groups = std.ArrayList(ConditionGroup).init(allocator);
-    var current_conditions = std.ArrayList(Condition).init(allocator);
+    var groups: std.ArrayListUnmanaged(ConditionGroup) = .empty;
+    var current_conditions: std.ArrayListUnmanaged(Condition) = .empty;
     var negated = false;
     var i = start;
 
@@ -205,32 +205,31 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
             i += 2;
         }
 
-        try current_conditions.append(.{ .key = key, .val = val, .op = op, .negated = negated });
+        try current_conditions.append(allocator, .{ .key = key, .val = val, .op = op, .negated = negated });
         negated = false;
 
         if (i < tokens.len) {
             const logical = tokens[i];
             i += 1;
             if (std.ascii.eqlIgnoreCase(logical, "or")) {
-                try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
-                current_conditions = std.ArrayList(Condition).init(allocator);
+                try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
+                current_conditions = .empty;
             } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
                 return error.InvalidCondition;
             }
         }
     }
 
-    if (current_conditions.items.len > 0) try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
-    return groups.toOwnedSlice();
+    if (current_conditions.items.len > 0) try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
+    return groups.toOwnedSlice(allocator);
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Config {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    var args = std.process.args();
     _ = args.skip();
 
     // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
-    var tokens = std.ArrayList([]const u8).init(allocator);
+    var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
     var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
 
     while (args.next()) |arg| {
@@ -252,7 +251,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--header")) {
             config.header = true;
         } else {
-            try tokens.append(try allocator.dupe(u8, arg));
+            try tokens.append(allocator, try allocator.dupe(u8, arg));
         }
     }
 
