@@ -50,10 +50,7 @@ const AggState = union(enum) {
     avg: struct { sum: f64, count: usize },
 };
 
-const Buffer = struct { 
-    data: []u8, 
-    len: usize = 0 
-};
+const Buffer = struct { data: []u8, len: usize = 0 };
 
 const ReaderCtx = struct {
     file: std.fs.File,
@@ -103,9 +100,13 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
 
             var actual_val = c.val;
             var type_forced: TypeForced = .none;
-            if (std.mem.startsWith(u8, actual_val, "s:")) { actual_val = actual_val[2..]; type_forced = .string;
-            } else if (std.mem.startsWith(u8, actual_val, "n:") or std.mem.startsWith(u8, actual_val, "b:")) { actual_val = actual_val[2..];
-            type_forced = .numeric; }
+            if (std.mem.startsWith(u8, actual_val, "s:")) {
+                actual_val = actual_val[2..];
+                type_forced = .string;
+            } else if (std.mem.startsWith(u8, actual_val, "n:") or std.mem.startsWith(u8, actual_val, "b:")) {
+                actual_val = actual_val[2..];
+                type_forced = .numeric;
+            }
 
             var in_vals_list = std.ArrayList([]const u8).init(allocator);
             var in_vals_quoted_list = std.ArrayList([]const u8).init(allocator);
@@ -147,9 +148,9 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
         if (p.ptype != .raw) has_aggs = true;
     }
 
-    return CompiledPlan{ 
-        .groups = comp_groups, 
-        .pluck = pks, 
+    return CompiledPlan{
+        .groups = comp_groups,
+        .pluck = pks,
         .has_aggregations = has_aggs,
         .format = config.format,
         .limit = config.limit,
@@ -207,26 +208,26 @@ inline fn evaluateValue(rest_si: []const u8, cond: *const CompiledCondition) boo
             if (cond.val_f64) |target_f64| {
                 if (cond.type_forced == .string and !is_json_string) return false;
                 if (cond.type_forced == .numeric and is_json_string) return false;
-                
+
                 if (extractValueFromRest(rest_si)) |extracted| {
                     if (cond.val_i64) |target_i64| {
                         if (parseFastInt(extracted)) |parsed_i64| {
-                            return switch (cond.op) { 
-                                .gt => parsed_i64 > target_i64, 
-                                .lt => parsed_i64 < target_i64, 
-                                .gte => parsed_i64 >= target_i64, 
-                                .lte => parsed_i64 <= target_i64, 
-                                else => unreachable 
+                            return switch (cond.op) {
+                                .gt => parsed_i64 > target_i64,
+                                .lt => parsed_i64 < target_i64,
+                                .gte => parsed_i64 >= target_i64,
+                                .lte => parsed_i64 <= target_i64,
+                                else => unreachable,
                             };
                         }
                     }
                     if (std.fmt.parseFloat(f64, extracted)) |parsed_f64| {
-                        return switch (cond.op) { 
-                            .gt => parsed_f64 > target_f64, 
-                            .lt => parsed_f64 < target_f64, 
-                            .gte => parsed_f64 >= target_f64, 
-                            .lte => parsed_f64 <= target_f64, 
-                            else => unreachable 
+                        return switch (cond.op) {
+                            .gt => parsed_f64 > target_f64,
+                            .lt => parsed_f64 < target_f64,
+                            .gte => parsed_f64 >= target_f64,
+                            .lte => parsed_f64 <= target_f64,
+                            else => unreachable,
                         };
                     } else |_| {}
                 }
@@ -238,7 +239,7 @@ inline fn evaluateValue(rest_si: []const u8, cond: *const CompiledCondition) boo
 
 inline fn checkSimdChunk(line: []const u8, cond: *const CompiledCondition, fcv: V, i: usize) bool {
     const chunk: V = line[i..][0..VECTOR_LEN].*;
-    const next_chunk: V = line[i + 1..][0..VECTOR_LEN].*;
+    const next_chunk: V = line[i + 1 ..][0..VECTOR_LEN].*;
     const matches_mask = @as(u32, @bitCast(chunk == QUOTE_VEC)) & @as(u32, @bitCast(next_chunk == fcv));
 
     if (matches_mask != 0) {
@@ -249,7 +250,7 @@ inline fn checkSimdChunk(line: []const u8, cond: *const CompiledCondition, fcv: 
             if (line.len - pos >= cond.key_quoted.len) {
                 if (std.mem.eql(u8, line[pos + 2 .. pos + cond.key_quoted.len], cond.key_quoted[2..])) {
                     if (cond.op == .exists) return true;
-                    const rest = line[pos + cond.key_quoted.len..];
+                    const rest = line[pos + cond.key_quoted.len ..];
                     const val_rest = skipToValue(rest);
                     if (val_rest.len > 0) {
                         if (evaluateValue(val_rest, cond)) return true;
@@ -268,12 +269,14 @@ inline fn lineMatchesInternal(line: []const u8, cond: *const CompiledCondition, 
         var j: usize = 0;
         const key = cond.key_quoted;
         while (std.mem.indexOfScalarPos(u8, line, j, '"')) |kp| {
-            if (kp + key.len <= line.len and line[kp+1] == key[1]) {
+            if (kp + key.len <= line.len and line[kp + 1] == key[1]) {
                 if (std.mem.eql(u8, line[kp + 2 .. kp + key.len], key[2..])) {
                     if (cond.op == .exists) return true;
-                    const rest = line[kp + key.len..];
+                    const rest = line[kp + key.len ..];
                     const val_rest = skipToValue(rest);
-                    if (val_rest.len > 0) { if (evaluateValue(val_rest, cond)) return true; }
+                    if (val_rest.len > 0) {
+                        if (evaluateValue(val_rest, cond)) return true;
+                    }
                 }
             }
             j = kp + 1;
@@ -296,7 +299,7 @@ inline fn evaluatePlan(line: []const u8, plan: *const CompiledPlan) bool {
 
     for (plan.groups) |*group| {
         var gm = true;
-        for (group.conditions) |*cond| { 
+        for (group.conditions) |*cond| {
             if (lineMatchesInternal(line, cond, cond.fcv) == cond.negated) {
                 gm = false;
                 break;
@@ -328,7 +331,10 @@ inline fn extractValueFromRest(vs: []const u8) ?[]const u8 {
                 i += next_idx;
                 var bc: usize = 0;
                 var j = i;
-                while (j > 1) { j -= 1; if (vs[j] == '\\') bc += 1 else break; }
+                while (j > 1) {
+                    j -= 1;
+                    if (vs[j] == '\\') bc += 1 else break;
+                }
                 if (bc % 2 == 0) return vs[1..i];
                 i += 1;
             } else {
@@ -347,10 +353,10 @@ inline fn extractValueFromRest(vs: []const u8) ?[]const u8 {
 inline fn extractValueSingle(line: []const u8, pk_quoted: []const u8) ?[]const u8 {
     var search = line;
     while (std.mem.indexOf(u8, search, pk_quoted)) |kp| {
-        const rest = search[kp + pk_quoted.len..];
+        const rest = search[kp + pk_quoted.len ..];
         const val_rest = skipToValue(rest);
-        if (val_rest.len > 0) { 
-            if (extractValueFromRest(val_rest)) |val| return val; 
+        if (val_rest.len > 0) {
+            if (extractValueFromRest(val_rest)) |val| return val;
         }
         search = rest;
     }
@@ -384,62 +390,75 @@ fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, f
     };
 
     if (format == .json) {
-        buf[cursor] = '{'; cursor += 1;
+        buf[cursor] = '{';
+        cursor += 1;
         var first = true;
         for (results, 0..) |res, i| {
             if (res) |val| {
                 if (!first) {
                     try Flush.check(&cursor, 2, &buf, writer);
-                    buf[cursor] = ','; buf[cursor+1] = ' '; cursor += 2;
+                    buf[cursor] = ',';
+                    buf[cursor + 1] = ' ';
+                    cursor += 2;
                 }
                 first = false;
-                
+
                 try Flush.check(&cursor, 1, &buf, writer);
-                buf[cursor] = '"'; cursor += 1;
-                
+                buf[cursor] = '"';
+                cursor += 1;
+
                 const key = plucks[i].original_str;
                 try Flush.append(&cursor, &buf, key, writer);
-                
+
                 try Flush.check(&cursor, 3, &buf, writer);
-                buf[cursor] = '"'; buf[cursor+1] = ':'; buf[cursor+2] = ' '; cursor += 3;
-                
+                buf[cursor] = '"';
+                buf[cursor + 1] = ':';
+                buf[cursor + 2] = ' ';
+                cursor += 3;
+
                 if (isFastPrimitive(val)) {
                     try Flush.append(&cursor, &buf, val, writer);
                 } else {
                     try Flush.check(&cursor, 1, &buf, writer);
-                    buf[cursor] = '"'; cursor += 1;
-                    
+                    buf[cursor] = '"';
+                    cursor += 1;
+
                     try Flush.append(&cursor, &buf, val, writer);
-                    
+
                     try Flush.check(&cursor, 1, &buf, writer);
-                    buf[cursor] = '"'; cursor += 1;
+                    buf[cursor] = '"';
+                    cursor += 1;
                 }
             }
         }
         try Flush.check(&cursor, 2, &buf, writer);
-        buf[cursor] = '}'; buf[cursor+1] = '\n'; cursor += 2;
+        buf[cursor] = '}';
+        buf[cursor + 1] = '\n';
+        cursor += 2;
         try writer.writeAll(buf[0..cursor]);
-        
     } else if (format == .csv) {
         for (results, 0..) |res, i| {
             if (res) |val| {
                 try Flush.check(&cursor, 1, &buf, writer);
-                buf[cursor] = '"'; cursor += 1;
-                
+                buf[cursor] = '"';
+                cursor += 1;
+
                 try Flush.append(&cursor, &buf, val, writer);
-                
+
                 try Flush.check(&cursor, 1, &buf, writer);
-                buf[cursor] = '"'; cursor += 1;
+                buf[cursor] = '"';
+                cursor += 1;
             }
             if (i < results.len - 1) {
                 try Flush.check(&cursor, 1, &buf, writer);
-                buf[cursor] = ','; cursor += 1;
+                buf[cursor] = ',';
+                cursor += 1;
             }
         }
         try Flush.check(&cursor, 1, &buf, writer);
-        buf[cursor] = '\n'; cursor += 1;
+        buf[cursor] = '\n';
+        cursor += 1;
         try writer.writeAll(buf[0..cursor]);
-        
     } else {
         for (results, 0..) |res, i| {
             if (res) |val| {
@@ -447,11 +466,13 @@ fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, f
             }
             if (i < results.len - 1) {
                 try Flush.check(&cursor, 1, &buf, writer);
-                buf[cursor] = '\t'; cursor += 1;
+                buf[cursor] = '\t';
+                cursor += 1;
             }
         }
         try Flush.check(&cursor, 1, &buf, writer);
-        buf[cursor] = '\n'; cursor += 1;
+        buf[cursor] = '\n';
+        cursor += 1;
         try writer.writeAll(buf[0..cursor]);
     }
 }
@@ -461,9 +482,15 @@ inline fn formatAggValue(state: AggState, comptime with_nulls: bool, writer: any
         .raw => if (with_nulls) try writer.writeAll("null"),
         .count => |c| try writer.print("{d}", .{c}),
         .sum => |s| try writer.print("{d:.4}", .{s}),
-        .min => |m| if (m == std.math.inf(f64)) { if (with_nulls) try writer.writeAll("null"); } else try writer.print("{d:.4}", .{m}),
-        .max => |m| if (m == -std.math.inf(f64)) { if (with_nulls) try writer.writeAll("null"); } else try writer.print("{d:.4}", .{m}),
-        .avg => |a| if (a.count == 0) { if (with_nulls) try writer.writeAll("null"); } else try writer.print("{d:.4}", .{a.sum / @as(f64, @floatFromInt(a.count))}),
+        .min => |m| if (m == std.math.inf(f64)) {
+            if (with_nulls) try writer.writeAll("null");
+        } else try writer.print("{d:.4}", .{m}),
+        .max => |m| if (m == -std.math.inf(f64)) {
+            if (with_nulls) try writer.writeAll("null");
+        } else try writer.print("{d:.4}", .{m}),
+        .avg => |a| if (a.count == 0) {
+            if (with_nulls) try writer.writeAll("null");
+        } else try writer.print("{d:.4}", .{a.sum / @as(f64, @floatFromInt(a.count))}),
     }
 }
 
@@ -502,7 +529,7 @@ fn handleMatch(line_raw: []const u8, plan: *const CompiledPlan, agg_states: []Ag
     var results: [256]?[]const u8 = undefined;
     const max_keys = @min(pluck_keys.len, 256);
     @memset(results[0..max_keys], null);
-    
+
     if (pluck_keys.len == 1) {
         if (extractValueSingle(line, pluck_keys[0].key_quoted)) |val| {
             results[0] = val;
@@ -512,21 +539,19 @@ fn handleMatch(line_raw: []const u8, plan: *const CompiledPlan, agg_states: []Ag
         var search = line;
         while (search.len > 0 and found_count < max_keys) {
             const quote_idx = std.mem.indexOfScalar(u8, search, '"') orelse break;
-            search = search[quote_idx..]; 
-            
+            search = search[quote_idx..];
+
             const end_quote_idx = std.mem.indexOfScalar(u8, search[1..], '"');
             if (end_quote_idx == null) break;
-            
+
             const full_key = search[0 .. end_quote_idx.? + 2];
             search = search[end_quote_idx.? + 2 ..];
-            
-            if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos|
-            {
+
+            if (std.mem.indexOfNone(u8, search, " \t")) |colon_pos| {
                 if (search[colon_pos] == ':') {
                     const rest = search[colon_pos + 1 ..];
                     if (std.mem.indexOfNone(u8, rest, " \t")) |val_start| {
-                        if (extractValueFromRest(rest[val_start..])) |val|
-                        {
+                        if (extractValueFromRest(rest[val_start..])) |val| {
                             // FIX: Assign the extracted value to ALL pluck keys that want it!
                             for (pluck_keys[0..max_keys], 0..) |pk, i| {
                                 if (results[i] == null and std.mem.eql(u8, full_key, pk.key_quoted)) {
@@ -536,7 +561,7 @@ fn handleMatch(line_raw: []const u8, plan: *const CompiledPlan, agg_states: []Ag
                             }
 
                             if (rest[val_start] == '"') {
-                                search = rest[val_start + val.len + 2 ..]; 
+                                search = rest[val_start + val.len + 2 ..];
                             } else {
                                 search = rest[val_start + val.len ..];
                             }
@@ -610,14 +635,23 @@ fn readerThread(ctx: *ReaderCtx) void {
             ctx.fill_sem.post();
             break;
         };
-        if (rc == 0) { buf.len = leftover_count; ctx.done.store(true, .release); ctx.fill_sem.post(); break; }
+        if (rc == 0) {
+            buf.len = leftover_count;
+            ctx.done.store(true, .release);
+            ctx.fill_sem.post();
+            break;
+        }
         const total = leftover_count + rc;
         if (std.mem.lastIndexOfScalar(u8, buf.data[0..total], '\n')) |idx| {
             const boundary = idx + 1;
             leftover_count = total - boundary;
             if (leftover_count > 0) @memcpy(leftover_buf[0..leftover_count], buf.data[boundary..total]);
             buf.len = boundary;
-        } else { leftover_count = total; @memcpy(leftover_buf[0..leftover_count], buf.data[0..total]); buf.len = 0; }
+        } else {
+            leftover_count = total;
+            @memcpy(leftover_buf[0..leftover_count], buf.data[0..total]);
+            buf.len = 0;
+        }
         ctx.current_idx = 1 - ctx.current_idx;
         ctx.fill_sem.post();
     }
@@ -664,7 +698,8 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
 
                     const is_match = if (is_single)
                         lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
-                    else evaluatePlan(line, plan);
+                    else
+                        evaluatePlan(line, plan);
 
                     if (is_match) {
                         try handleMatch(line, plan, agg_states, writer);
@@ -686,7 +721,8 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
                 const line = data[sol .. sol + nl_pos];
                 const is_match = if (is_single)
                     lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
-                else evaluatePlan(line, plan);
+                else
+                    evaluatePlan(line, plan);
 
                 if (is_match) {
                     try handleMatch(line, plan, agg_states, writer);
@@ -707,7 +743,8 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
                 if (line.len > 0) {
                     const is_match = if (is_single)
                         lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
-                    else evaluatePlan(line, plan);
+                    else
+                        evaluatePlan(line, plan);
 
                     if (is_match) {
                         try handleMatch(line, plan, agg_states, writer);
@@ -719,7 +756,9 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
         consume_idx = 1 - consume_idx;
         ctx.read_sem.post();
         if (ctx.done.load(.acquire) and ctx.fill_sem.permits == 0) break;
-        if (comptime has_limit) { if (match_count >= limit) break; }
+        if (comptime has_limit) {
+            if (match_count >= limit) break;
+        }
     }
     return match_count;
 }
@@ -752,7 +791,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
     var ctx = ReaderCtx{ .file = file, .bufs = .{ .{ .data = try allocator.alloc(u8, BLOCK_SIZE) }, .{ .data = try allocator.alloc(u8, BLOCK_SIZE) } }, .done = std.atomic.Value(bool).init(false), .fill_sem = &fill_sem, .read_sem = &read_sem };
     defer allocator.free(ctx.bufs[0].data);
     defer allocator.free(ctx.bufs[1].data);
-    
+
     const thread = try std.Thread.spawn(.{}, readerThread, .{&ctx});
 
     // Print header row if requested
@@ -764,7 +803,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
         }
         try writer.writeByte('\n');
     }
-    
+
     const is_single = plan.groups.len == 1 and plan.groups[0].conditions.len == 1;
     var match_count: usize = 0;
     if (plan.limit != null) {
@@ -780,7 +819,7 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
             match_count = try runSearchLoop(false, false, &plan, &ctx, agg_states, writer);
         }
     }
-    
+
     // Unblock reader thread if it's waiting on read_sem
     ctx.done.store(true, .release);
     ctx.read_sem.post();

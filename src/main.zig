@@ -42,7 +42,7 @@ pub fn main() !void {
 
     const config = parseArgs(allocator) catch |err| {
         if (err == error.HelpRequested) std.process.exit(0);
-        
+
         const msg = switch (err) {
             error.MissingFileValue => "Error: --file requires a path argument.",
             error.MissingLimitValue => "Error: --limit requires a number.",
@@ -241,10 +241,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             config.limit = try std.fmt.parseInt(usize, lim_str, 10);
         } else if (std.mem.eql(u8, arg, "--format")) {
             const fmt_str = args.next() orelse return error.MissingFormatValue;
-            if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv
-            else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json
-            else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv
-            else return error.InvalidFormat;
+            if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
