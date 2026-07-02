@@ -53,12 +53,12 @@ const AggState = union(enum) {
 const Buffer = struct { data: []u8, len: usize = 0 };
 
 const ReaderCtx = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     bufs: [2]Buffer,
     current_idx: usize = 0,
     done: std.atomic.Value(bool),
-    fill_sem: *std.Thread.Semaphore,
-    read_sem: *std.Thread.Semaphore,
+    fill_sem: *std.Io.Semaphore,
+    read_sem: *std.Io.Semaphore,
 };
 
 inline fn isFastPrimitive(val: []const u8) bool {
@@ -618,27 +618,27 @@ fn handleMatch(line_raw: []const u8, plan: *const CompiledPlan, agg_states: []Ag
     }
 }
 
-fn readerThread(ctx: *ReaderCtx) void {
+fn readerThread(ctx: *ReaderCtx, io: std.Io) !void {
     var leftover_count: usize = 0;
     var leftover_buf = std.heap.page_allocator.alloc(u8, 2 * BLOCK_SIZE) catch return;
     defer std.heap.page_allocator.free(leftover_buf);
 
     while (true) {
-        ctx.read_sem.wait();
+        try ctx.read_sem.wait(io);
         if (ctx.done.load(.acquire)) break;
         const buf = &ctx.bufs[ctx.current_idx];
         if (leftover_count > 0) @memcpy(buf.data[0..leftover_count], leftover_buf[0..leftover_count]);
-        const rc = ctx.file.read(buf.data[leftover_count..]) catch |err| {
+        const rc = ctx.file.readStreaming(io, &.{buf.data[leftover_count..]}) catch |err| {
             std.debug.print("zog: read error: {s}\n", .{@errorName(err)});
             buf.len = leftover_count;
             ctx.done.store(true, .release);
-            ctx.fill_sem.post();
+            ctx.fill_sem.post(io);
             break;
         };
         if (rc == 0) {
             buf.len = leftover_count;
             ctx.done.store(true, .release);
-            ctx.fill_sem.post();
+            ctx.fill_sem.post(io);
             break;
         }
         const total = leftover_count + rc;
@@ -653,21 +653,21 @@ fn readerThread(ctx: *ReaderCtx) void {
             buf.len = 0;
         }
         ctx.current_idx = 1 - ctx.current_idx;
-        ctx.fill_sem.post();
+        ctx.fill_sem.post(io);
     }
 }
 
-pub fn searchFile(allocator: std.mem.Allocator, config: main.Config, writer: *std.Io.Writer) !usize {
-    const file = try std.fs.cwd().openFile(config.file_path.?, .{});
-    defer file.close();
-    return try searchFileInternal(allocator, file, config, writer);
+pub fn searchFile(allocator: std.mem.Allocator, config: main.Config, writer: *std.Io.Writer, io: std.Io) !usize {
+    const file = try std.Io.Dir.cwd().openFile(io, config.file_path.?, .{});
+    defer file.close(io);
+    return try searchFileInternal(allocator, file, config, writer, io);
 }
 
-pub fn searchStream(allocator: std.mem.Allocator, config: main.Config, writer: *std.Io.Writer) !usize {
-    return try searchFileInternal(allocator, std.fs.File.stdin(), config, writer);
+pub fn searchStream(allocator: std.mem.Allocator, config: main.Config, writer: *std.Io.Writer, io: std.Io) !usize {
+    return try searchFileInternal(allocator, std.Io.File.stdin(), config, writer, io);
 }
 
-inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan: *const CompiledPlan, ctx: *ReaderCtx, agg_states: []AggState, writer: *std.Io.Writer) !usize {
+inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan: *const CompiledPlan, ctx: *ReaderCtx, agg_states: []AggState, writer: *std.Io.Writer, io: std.Io) !usize {
     var consume_idx: usize = 0;
     const nlv: V = @splat('\n');
 
@@ -680,7 +680,7 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
 
     // `comptime has_limit` means all limit checks are eliminated at compile time when false
     outer: while (true) {
-        ctx.fill_sem.wait();
+        try ctx.fill_sem.wait(io);
         const buf = &ctx.bufs[consume_idx];
         if (buf.len == 0 and ctx.done.load(.acquire)) break;
 
@@ -739,7 +739,7 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
         }
         if (ctx.done.load(.acquire) and sol < data.len) {
             if (!has_limit or match_count < limit) {
-                const line = std.mem.trimRight(u8, data[sol..], "\r\n");
+                const line = std.mem.trimEnd(u8, data[sol..], "\r\n");
                 if (line.len > 0) {
                     const is_match = if (is_single)
                         lineMatchesInternal(line, single_cond, fcv) != single_cond.negated
@@ -754,7 +754,7 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
             }
         }
         consume_idx = 1 - consume_idx;
-        ctx.read_sem.post();
+        ctx.read_sem.post(io);
         if (ctx.done.load(.acquire) and ctx.fill_sem.permits == 0) break;
         if (comptime has_limit) {
             if (match_count >= limit) break;
@@ -763,7 +763,7 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
     return match_count;
 }
 
-fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: main.Config, writer: *std.Io.Writer) !usize {
+fn searchFileInternal(allocator: std.mem.Allocator, file: std.Io.File, config: main.Config, writer: *std.Io.Writer, io: std.Io) !usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const plan = try compilePlan(arena.allocator(), config);
@@ -785,14 +785,14 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
         }
     }
 
-    var fill_sem = std.Thread.Semaphore{ .permits = 0 };
-    var read_sem = std.Thread.Semaphore{ .permits = 2 };
+    var fill_sem = std.Io.Semaphore{ .permits = 0 };
+    var read_sem = std.Io.Semaphore{ .permits = 2 };
 
     var ctx = ReaderCtx{ .file = file, .bufs = .{ .{ .data = try allocator.alloc(u8, BLOCK_SIZE) }, .{ .data = try allocator.alloc(u8, BLOCK_SIZE) } }, .done = std.atomic.Value(bool).init(false), .fill_sem = &fill_sem, .read_sem = &read_sem };
     defer allocator.free(ctx.bufs[0].data);
     defer allocator.free(ctx.bufs[1].data);
 
-    const thread = try std.Thread.spawn(.{}, readerThread, .{&ctx});
+    const thread = try std.Thread.spawn(.{}, readerThread, .{ &ctx, io });
 
     // Print header row if requested
     if (plan.header and plan.pluck.len > 0 and !plan.count_only) {
@@ -808,21 +808,21 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: m
     var match_count: usize = 0;
     if (plan.limit != null) {
         if (is_single) {
-            match_count = try runSearchLoop(true, true, &plan, &ctx, agg_states, writer);
+            match_count = try runSearchLoop(true, true, &plan, &ctx, agg_states, writer, io);
         } else {
-            match_count = try runSearchLoop(true, false, &plan, &ctx, agg_states, writer);
+            match_count = try runSearchLoop(true, false, &plan, &ctx, agg_states, writer, io);
         }
     } else {
         if (is_single) {
-            match_count = try runSearchLoop(false, true, &plan, &ctx, agg_states, writer);
+            match_count = try runSearchLoop(false, true, &plan, &ctx, agg_states, writer, io);
         } else {
-            match_count = try runSearchLoop(false, false, &plan, &ctx, agg_states, writer);
+            match_count = try runSearchLoop(false, false, &plan, &ctx, agg_states, writer, io);
         }
     }
 
     // Unblock reader thread if it's waiting on read_sem
     ctx.done.store(true, .release);
-    ctx.read_sem.post();
+    ctx.read_sem.post(io);
     thread.join();
 
     if (plan.count_only) {

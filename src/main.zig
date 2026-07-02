@@ -32,7 +32,8 @@ pub const Config = struct {
     header: bool = false,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer if (gpa.deinit() == .leak) std.debug.print("warning: memory leak detected\n", .{});
 
@@ -40,8 +41,8 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var args_iter = std.process.args();
-    const config = parseArgs(allocator, &args_iter) catch |err| {
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    const config = parseArgs(allocator, &args_iter, io) catch |err| {
         if (err == error.HelpRequested) std.process.exit(0);
 
         const msg = switch (err) {
@@ -61,7 +62,7 @@ pub fn main() !void {
     };
 
     if (config.file_path == null) {
-        if (std.fs.File.stdin().isTty()) {
+        if (try std.Io.File.stdin().isTty(io)) {
             std.debug.print("Error: No input file specified and no data piped to stdin.\n", .{});
             std.debug.print("Provide a file with '--file <path>' or pipe data: 'cat logs.jsonl | zog ...'\n", .{});
             std.debug.print("Run 'zog --help' for usage information.\n", .{});
@@ -70,15 +71,15 @@ pub fn main() !void {
     }
 
     var stdout_buffer: [128 * 1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     if (config.file_path) |_| {
-        const matched = try Scanner.searchFile(allocator, config, stdout);
+        const matched = try Scanner.searchFile(allocator, config, stdout, io);
         stdout.flush() catch {};
         if (matched == 0) std.process.exit(1);
     } else {
-        const matched = try Scanner.searchStream(allocator, config, stdout);
+        const matched = try Scanner.searchStream(allocator, config, stdout, io);
         stdout.flush() catch {};
         if (matched == 0) std.process.exit(1);
     }
@@ -224,7 +225,7 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
     return groups.toOwnedSlice(allocator);
 }
 
-fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.ArgIterator) !Config {
+fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, io: std.Io) !Config {
     _ = args_iter.skip();
 
     // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
@@ -244,7 +245,7 @@ fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.ArgIterator) 
             return error.HelpRequested;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             var ver_buf: [64]u8 = undefined;
-            var ver_writer = std.fs.File.stdout().writer(&ver_buf);
+            var ver_writer = std.Io.File.stdout().writer(io, &ver_buf);
             ver_writer.interface.print("zog v{s}\n", .{VERSION}) catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
