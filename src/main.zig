@@ -33,14 +33,15 @@ pub const Config = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer if (gpa.deinit() == .leak) std.debug.print("warning: memory leak detected\n", .{});
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const config = parseArgs(allocator) catch |err| {
+    var args_iter = std.process.args();
+    const config = parseArgs(allocator, &args_iter) catch |err| {
         if (err == error.HelpRequested) std.process.exit(0);
 
         const msg = switch (err) {
@@ -59,9 +60,8 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Enforce File vs Pipe Check: Ensure we aren't just idling on a terminal
     if (config.file_path == null) {
-        if (std.io.getStdIn().isTty()) {
+        if (std.fs.File.stdin().isTty()) {
             std.debug.print("Error: No input file specified and no data piped to stdin.\n", .{});
             std.debug.print("Provide a file with '--file <path>' or pipe data: 'cat logs.jsonl | zog ...'\n", .{});
             std.debug.print("Run 'zog --help' for usage information.\n", .{});
@@ -69,17 +69,17 @@ pub fn main() !void {
         }
     }
 
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.BufferedWriter(128 * 1024, @TypeOf(stdout_file)){ .unbuffered_writer = stdout_file };
-    const stdout = bw.writer();
+    var stdout_buffer: [128 * 1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
     if (config.file_path) |_| {
         const matched = try Scanner.searchFile(allocator, config, stdout);
-        bw.flush() catch {};
+        stdout.flush() catch {};
         if (matched == 0) std.process.exit(1);
     } else {
         const matched = try Scanner.searchStream(allocator, config, stdout);
-        bw.flush() catch {};
+        stdout.flush() catch {};
         if (matched == 0) std.process.exit(1);
     }
 }
@@ -224,27 +224,28 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
     return groups.toOwnedSlice(allocator);
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Config {
-    var args = std.process.args();
-    _ = args.skip();
+fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.ArgIterator) !Config {
+    _ = args_iter.skip();
 
     // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
     var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
     var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
 
-    while (args.next()) |arg| {
+    while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--file")) {
-            config.file_path = try allocator.dupe(u8, args.next() orelse return error.MissingFileValue);
+            config.file_path = try allocator.dupe(u8, args_iter.next() orelse return error.MissingFileValue);
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            const lim_str = args.next() orelse return error.MissingLimitValue;
+            const lim_str = args_iter.next() orelse return error.MissingLimitValue;
             config.limit = try std.fmt.parseInt(usize, lim_str, 10);
         } else if (std.mem.eql(u8, arg, "--format")) {
-            const fmt_str = args.next() orelse return error.MissingFormatValue;
+            const fmt_str = args_iter.next() orelse return error.MissingFormatValue;
             if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            std.io.getStdOut().writer().print("zog v{s}\n", .{VERSION}) catch {};
+            var ver_buf: [64]u8 = undefined;
+            var ver_writer = std.fs.File.stdout().writer(&ver_buf);
+            ver_writer.interface.print("zog v{s}\n", .{VERSION}) catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;

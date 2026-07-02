@@ -108,8 +108,8 @@ fn compilePlan(allocator: std.mem.Allocator, config: main.Config) !CompiledPlan 
                 type_forced = .numeric;
             }
 
-            var in_vals_list = std.ArrayList([]const u8).init(allocator);
-            var in_vals_quoted_list = std.ArrayList([]const u8).init(allocator);
+            var in_vals_list = std.array_list.Managed([]const u8).init(allocator);
+            var in_vals_quoted_list = std.array_list.Managed([]const u8).init(allocator);
             if (c.op == .in_op) {
                 var it = std.mem.splitScalar(u8, actual_val, ',');
                 while (it.next()) |v| {
@@ -363,20 +363,20 @@ inline fn extractValueSingle(line: []const u8, pk_quoted: []const u8) ?[]const u
     return null;
 }
 
-fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, format: main.OutputFormat, writer: anytype) !void {
+fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, format: main.OutputFormat, writer: *std.Io.Writer) !void {
     // 8KB Stack buffer to build the line without function call overhead
     var buf: [8192]u8 = undefined;
     var cursor: usize = 0;
 
     // Helper to safely write bytes to the scratch buffer
     const Flush = struct {
-        inline fn check(c: *usize, req: usize, b: []u8, w: anytype) !void {
+        inline fn check(c: *usize, req: usize, b: []u8, w: *std.Io.Writer) !void {
             if (c.* + req > b.len) {
                 try w.writeAll(b[0..c.*]);
                 c.* = 0;
             }
         }
-        inline fn append(c: *usize, b: []u8, val: []const u8, w: anytype) !void {
+        inline fn append(c: *usize, b: []u8, val: []const u8, w: *std.Io.Writer) !void {
             if (val.len >= b.len) {
                 try w.writeAll(b[0..c.*]);
                 c.* = 0;
@@ -477,7 +477,7 @@ fn printFormatted(results: []const ?[]const u8, plucks: []const CompiledPluck, f
     }
 }
 
-inline fn formatAggValue(state: AggState, comptime with_nulls: bool, writer: anytype) !void {
+inline fn formatAggValue(state: AggState, comptime with_nulls: bool, writer: *std.Io.Writer) !void {
     switch (state) {
         .raw => if (with_nulls) try writer.writeAll("null"),
         .count => |c| try writer.print("{d}", .{c}),
@@ -494,7 +494,7 @@ inline fn formatAggValue(state: AggState, comptime with_nulls: bool, writer: any
     }
 }
 
-fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck, format: main.OutputFormat, writer: anytype) !void {
+fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck, format: main.OutputFormat, writer: *std.Io.Writer) !void {
     if (format == .json) {
         try writer.writeAll("{");
         for (agg_states, 0..) |state, i| {
@@ -513,7 +513,7 @@ fn printAggregations(agg_states: []const AggState, plucks: []const CompiledPluck
     }
 }
 
-fn handleMatch(line_raw: []const u8, plan: *const CompiledPlan, agg_states: []AggState, writer: anytype) !void {
+fn handleMatch(line_raw: []const u8, plan: *const CompiledPlan, agg_states: []AggState, writer: *std.Io.Writer) !void {
     const line = if (line_raw.len > 0 and line_raw[line_raw.len - 1] == '\r') line_raw[0 .. line_raw.len - 1] else line_raw;
     if (plan.count_only) {
         agg_states[0].count += 1;
@@ -657,17 +657,17 @@ fn readerThread(ctx: *ReaderCtx) void {
     }
 }
 
-pub fn searchFile(allocator: std.mem.Allocator, config: main.Config, writer: anytype) !usize {
+pub fn searchFile(allocator: std.mem.Allocator, config: main.Config, writer: *std.Io.Writer) !usize {
     const file = try std.fs.cwd().openFile(config.file_path.?, .{});
     defer file.close();
     return try searchFileInternal(allocator, file, config, writer);
 }
 
-pub fn searchStream(allocator: std.mem.Allocator, config: main.Config, writer: anytype) !usize {
-    return try searchFileInternal(allocator, std.io.getStdIn(), config, writer);
+pub fn searchStream(allocator: std.mem.Allocator, config: main.Config, writer: *std.Io.Writer) !usize {
+    return try searchFileInternal(allocator, std.fs.File.stdin(), config, writer);
 }
 
-inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan: *const CompiledPlan, ctx: *ReaderCtx, agg_states: []AggState, writer: anytype) !usize {
+inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan: *const CompiledPlan, ctx: *ReaderCtx, agg_states: []AggState, writer: *std.Io.Writer) !usize {
     var consume_idx: usize = 0;
     const nlv: V = @splat('\n');
 
@@ -763,7 +763,7 @@ inline fn runSearchLoop(comptime has_limit: bool, comptime is_single: bool, plan
     return match_count;
 }
 
-fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: main.Config, writer: anytype) !usize {
+fn searchFileInternal(allocator: std.mem.Allocator, file: std.fs.File, config: main.Config, writer: *std.Io.Writer) !usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const plan = try compilePlan(arena.allocator(), config);
