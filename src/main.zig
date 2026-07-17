@@ -32,17 +32,19 @@ pub const Config = struct {
     header: bool = false,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer if (gpa.deinit() == .leak) std.debug.print("warning: memory leak detected\n", .{});
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const config = parseArgs(allocator) catch |err| {
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    const config = parseArgs(allocator, &args_iter, io) catch |err| {
         if (err == error.HelpRequested) std.process.exit(0);
-        
+
         const msg = switch (err) {
             error.MissingFileValue => "Error: --file requires a path argument.",
             error.MissingLimitValue => "Error: --limit requires a number.",
@@ -59,9 +61,8 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // Enforce File vs Pipe Check: Ensure we aren't just idling on a terminal
     if (config.file_path == null) {
-        if (std.io.getStdIn().isTty()) {
+        if (try std.Io.File.stdin().isTty(io)) {
             std.debug.print("Error: No input file specified and no data piped to stdin.\n", .{});
             std.debug.print("Provide a file with '--file <path>' or pipe data: 'cat logs.jsonl | zog ...'\n", .{});
             std.debug.print("Run 'zog --help' for usage information.\n", .{});
@@ -69,17 +70,17 @@ pub fn main() !void {
         }
     }
 
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.BufferedWriter(128 * 1024, @TypeOf(stdout_file)){ .unbuffered_writer = stdout_file };
-    const stdout = bw.writer();
+    var stdout_buffer: [128 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
     if (config.file_path) |_| {
-        const matched = try Scanner.searchFile(allocator, config, stdout);
-        bw.flush() catch {};
+        const matched = try Scanner.searchFile(allocator, config, stdout, io);
+        stdout.flush() catch {};
         if (matched == 0) std.process.exit(1);
     } else {
-        const matched = try Scanner.searchStream(allocator, config, stdout);
-        bw.flush() catch {};
+        const matched = try Scanner.searchStream(allocator, config, stdout, io);
+        stdout.flush() catch {};
         if (matched == 0) std.process.exit(1);
     }
 }
@@ -134,7 +135,7 @@ fn parseOp(op_str: []const u8) ?Operator {
 }
 
 fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) !struct { fields: []PluckField, next_i: usize } {
-    var pluck_keys = std.ArrayList(PluckField).init(allocator);
+    var pluck_keys: std.ArrayListUnmanaged(PluckField) = .empty;
     var i = start;
     const select_start_idx = i;
 
@@ -162,7 +163,7 @@ fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, s
                     key = p[4..];
                 }
 
-                try pluck_keys.append(.{ .key = key, .ptype = ptype, .original_str = p });
+                try pluck_keys.append(allocator, .{ .key = key, .ptype = ptype, .original_str = p });
             }
         }
         i += 1;
@@ -174,14 +175,14 @@ fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, s
     // Consume the optional WHERE keyword
     if (i < tokens.len and std.ascii.eqlIgnoreCase(tokens[i], "where")) i += 1;
 
-    const fields = try pluck_keys.toOwnedSlice();
+    const fields = try pluck_keys.toOwnedSlice(allocator);
     if (fields.len > MAX_PLUCK_FIELDS) return error.TooManyPluckFields;
     return .{ .fields = fields, .next_i = i };
 }
 
 fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
-    var groups = std.ArrayList(ConditionGroup).init(allocator);
-    var current_conditions = std.ArrayList(Condition).init(allocator);
+    var groups: std.ArrayListUnmanaged(ConditionGroup) = .empty;
+    var current_conditions: std.ArrayListUnmanaged(Condition) = .empty;
     var negated = false;
     var i = start;
 
@@ -205,57 +206,54 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
             i += 2;
         }
 
-        try current_conditions.append(.{ .key = key, .val = val, .op = op, .negated = negated });
+        try current_conditions.append(allocator, .{ .key = key, .val = val, .op = op, .negated = negated });
         negated = false;
 
         if (i < tokens.len) {
             const logical = tokens[i];
             i += 1;
             if (std.ascii.eqlIgnoreCase(logical, "or")) {
-                try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
-                current_conditions = std.ArrayList(Condition).init(allocator);
+                try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
+                current_conditions = .empty;
             } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
                 return error.InvalidCondition;
             }
         }
     }
 
-    if (current_conditions.items.len > 0) try groups.append(.{ .conditions = try current_conditions.toOwnedSlice() });
-    return groups.toOwnedSlice();
+    if (current_conditions.items.len > 0) try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
+    return groups.toOwnedSlice(allocator);
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Config {
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip();
+fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, io: std.Io) !Config {
+    _ = args_iter.skip();
 
     // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
-    var tokens = std.ArrayList([]const u8).init(allocator);
+    var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
     var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
 
-    while (args.next()) |arg| {
+    while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--file")) {
-            config.file_path = try allocator.dupe(u8, args.next() orelse return error.MissingFileValue);
+            config.file_path = try allocator.dupe(u8, args_iter.next() orelse return error.MissingFileValue);
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            const lim_str = args.next() orelse return error.MissingLimitValue;
+            const lim_str = args_iter.next() orelse return error.MissingLimitValue;
             config.limit = try std.fmt.parseInt(usize, lim_str, 10);
         } else if (std.mem.eql(u8, arg, "--format")) {
-            const fmt_str = args.next() orelse return error.MissingFormatValue;
-            if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv
-            else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json
-            else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv
-            else return error.InvalidFormat;
+            const fmt_str = args_iter.next() orelse return error.MissingFormatValue;
+            if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            std.io.getStdOut().writer().print("zog v{s}\n", .{VERSION}) catch {};
+            var ver_buf: [64]u8 = undefined;
+            var ver_writer = std.Io.File.stdout().writer(io, &ver_buf);
+            ver_writer.interface.print("zog v{s}\n", .{VERSION}) catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;
         } else if (std.mem.eql(u8, arg, "--header")) {
             config.header = true;
         } else {
-            try tokens.append(try allocator.dupe(u8, arg));
+            try tokens.append(allocator, try allocator.dupe(u8, arg));
         }
     }
 
