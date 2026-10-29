@@ -1,6 +1,21 @@
 # zog
 *A blisteringly fast JSONL search engine.*
 
+![zog and jq counting the error lines in a 462 MB log file: jq takes 9.0 s, zog 0.14 s](assets/demo.gif)
+
+*The same query on 2 million log lines (462 MB): `jq` takes 9.0 s, zog 0.14 s, with the same count. Recorded on an Apple M2 Pro.*
+
+```bash
+# macOS (Apple Silicon)
+curl -fL https://github.com/aikoschurmann/zog/releases/latest/download/zog-macos-arm64 -o zog && chmod +x zog && sudo mv zog /usr/local/bin/
+# Linux (x86_64)
+curl -fL https://github.com/aikoschurmann/zog/releases/latest/download/zog-linux-amd64 -o zog && chmod +x zog && sudo mv zog /usr/local/bin/
+```
+
+| 968 MB of JSONL, `level eq error` | jq | jaq | zog | zog `--fast` |
+|---|--:|--:|--:|--:|
+| Time | 17.4 s | 8.6 s | **0.26 s** | **0.10 s** |
+
 **zog** queries line-delimited JSON with a small SQL-like language: filter lines, pull out fields, and compute aggregates. It works in two layers. A SIMD search over the raw bytes rules out every line that provably can't match, and a validating JSON parser then decides the rest exactly. You get `jq`'s exact answers at close to `grep` speed: 20–60x faster than `jq`/`jaq` with exact results, and with `--fast` (bytes only, approximate) 30–180x faster and ahead of `ripgrep` on every search below.
 
 ```bash
