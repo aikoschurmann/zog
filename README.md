@@ -1,4 +1,4 @@
-# ⚡ zog
+# zog
 *A blisteringly fast JSONL search engine.*
 
 **zog** queries line-delimited JSON with a small SQL-like language: filter lines, pull out fields, and compute aggregates. It works in two layers. A SIMD search over the raw bytes rules out every line that provably can't match, and a validating JSON parser then decides the rest exactly. You get `jq`'s exact answers at close to `grep` speed: 20–60x faster than `jq`/`jaq` with exact results, and with `--fast` (bytes only, approximate) 30–180x faster and ahead of `ripgrep` on every search below.
@@ -11,7 +11,7 @@ tail -f app.jsonl | zog level eq error
 
 ---
 
-## 🚀 Benchmarks
+## Benchmarks
 
 All numbers are the best of 3 runs (5 for exact zog, 1 for jq/jaq), with the file in the OS page cache, on an Apple M2 Pro (16 GB). Versions: zog 1.0.0 (`ReleaseFast`), ripgrep 15.1.0, jaq 2.3.0, jq 1.7.1. Every tool returned the same matches. The `--fast` and ripgrep numbers were measured with zog 1.0.0, which only had the byte-level layer. The commands are listed under [Reproducing the benchmarks](#reproducing-the-benchmarks).
 
@@ -62,7 +62,7 @@ Most queries run at about 10 GB/s, on par with ripgrep's plain fixed-string coun
 
 ---
 
-## 🛠️ Usage
+## Usage
 
 ```text
 zog [options] [SELECT <fields> [WHERE]] <condition> [AND|OR <condition> ...]
@@ -79,7 +79,7 @@ zog reads the file given with `--file`, or standard input when it is omitted.
 | `--count`, `-c` | Print only the number of matching lines |
 | `--header` | Print a header row of field names (TSV/CSV) |
 | `--limit <n>` | Stop after `n` matches |
-| `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#️-limitations--trade-offs)) |
+| `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#limitations--trade-offs)) |
 | `--help`, `-h` | Show help |
 | `--version`, `-v` | Show the version |
 | `--` | Treat all following arguments as query terms (for keys starting with `--`) |
@@ -293,7 +293,7 @@ if zog --file logs.jsonl --count level eq error > /dev/null; then echo "errors f
 
 ---
 
-## 📦 Installation
+## Installation
 
 zog is a single static binary with no dependencies.
 
@@ -328,7 +328,7 @@ The binary ends up at `./zig-out/bin/zog`.
 
 ---
 
-## 🧠 How it works
+## How it works
 
 Tools like `jq` parse every line into a tree before they look at it. That is exact, but it caps them at roughly 0.1 GB/s. zog first treats the input as bytes and searches it with SIMD for lines that *could* match. Only those lines are parsed (sections 6 and 7), and the parse decides. The byte search is built so that it never drops a line the parser would accept: it may let through lines that don't match, but never lose one that does.
 
@@ -384,7 +384,7 @@ Apart from the two I/O buffers, the compiled plan and a reusable buffer for deco
 
 ---
 
-## ⚠️ Limitations & trade-offs
+## Limitations & trade-offs
 
 ### 1. Exact mode parses every line that might match
 
@@ -456,19 +456,19 @@ Match queries are timed with `-c` on both zog and ripgrep, because ripgrep stops
 
 ---
 
-## 🎯 Use cases
+## Use cases
 
-✅ **DevOps & SRE:** filter production logs for errors, slow requests or 5xx responses
-✅ **Security:** hunt through audit and access logs
-✅ **Data engineering:** pre-filter large datasets before loading them elsewhere
-✅ **Analytics:** count, sum and average over gigabytes in a single pass
-✅ **CLI workflows:** chain with `sort`, `uniq`, `awk` and friends
-✅ **Live monitoring:** filter `tail -f` or `journalctl -f` output as it arrives
+- **DevOps & SRE:** filter production logs for errors, slow requests or 5xx responses
+- **Security:** hunt through audit and access logs
+- **Data engineering:** pre-filter large datasets before loading them elsewhere
+- **Analytics:** count, sum and average over gigabytes in a single pass
+- **CLI workflows:** chain with `sort`, `uniq`, `awk` and friends
+- **Live monitoring:** filter `tail -f` or `journalctl -f` output as it arrives
 
-❌ **Not suitable for:** validating JSON, queries that depend on nesting, pretty-printed JSON, or formats other than JSONL.
+**Not suitable for:** validating JSON, queries that depend on nesting, pretty-printed JSON, or formats other than JSONL.
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Open an issue or a pull request on [GitHub](https://github.com/aikoschurmann/zog).
