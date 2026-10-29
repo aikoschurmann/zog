@@ -1,9 +1,9 @@
 # zog
 *A blisteringly fast JSONL search engine.*
 
-![zog and jq counting the error lines in a 462 MB log file: jq takes 9.0 s, zog 0.14 s](assets/demo.gif)
+![zog and jq counting the error lines in a 462 MB log file: jq takes 9.0 s, zog 0.13 s](assets/demo.gif)
 
-*The same query on 2 million log lines (462 MB): `jq` takes 9.0 s, zog 0.14 s, with the same count. Recorded on an Apple M2 Pro.*
+*The same query on 2 million log lines (462 MB): `jq` takes 9.0 s (cut in gif for brevity), zog 0.14 s, with the same count. Recorded on an Apple M2 Pro.*
 
 ```bash
 # macOS (Apple Silicon)

@@ -11,7 +11,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 30ms
 
 Hide
-Type `export PATH=$PWD:$PATH PS1='$ ' TIMEFORMAT='took %Rs' && clear`
+Type `export PATH=$PWD:$PATH PS1='$ ' TIMEFORMAT='took %Rs' && zog --file logs.jsonl -c level eq error >/dev/null && clear`
 Enter
 Sleep 500ms
 Show
@@ -21,7 +21,12 @@ Enter
 Sleep 1s
 Type `time jq -c 'select(.level=="error")' logs.jsonl | wc -l`
 Enter
-Sleep 10s
+# jq takes ~9 s; skip the frozen frames, its "took" line still shows the real time
+Sleep 1.2s
+Hide
+Sleep 9s
+Show
+Sleep 1.5s
 Type `time zog --file logs.jsonl -c level eq error`
 Enter
 Sleep 2.5s
