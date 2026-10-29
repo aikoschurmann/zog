@@ -307,7 +307,7 @@ curl -L https://github.com/aikoschurmann/zog/releases/latest/download/zog-macos-
 chmod +x zog && sudo mv zog /usr/local/bin/
 
 # Linux (x86_64)
-curl -L https://github.com/aikoschurmann/zog/releases/latest/download/zog-linux-x64 -o zog
+curl -L https://github.com/aikoschurmann/zog/releases/latest/download/zog-linux-amd64 -o zog
 chmod +x zog && sudo mv zog /usr/local/bin/
 ```
 
