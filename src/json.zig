@@ -2,11 +2,14 @@
 //! and JSON string decoding. Lines the byte-level prefilter can't rule out are parsed here.
 const std = @import("std");
 const builtin = @import("builtin");
+const utf8 = @import("utf8.zig");
+
+const validUtf8 = utf8.validUtf8;
 
 pub const Error = error{Invalid};
 
 /// Lines nested deeper than this are treated as invalid.
-const MAX_DEPTH = 64 * 1024;
+pub const MAX_DEPTH = 64 * 1024;
 
 /// The key paths a query needs, as a tree of object keys. Each requested path has a slot that
 /// the parser fills with the raw text of its value. A node's slot and those of everything
@@ -67,7 +70,7 @@ pub const PathTrie = struct {
     }
 };
 
-const Str = struct { raw: []const u8, escaped: bool };
+pub const Str = struct { raw: []const u8, escaped: bool };
 
 /// Bytes per stage-1 chunk, one bit each in a u64 mask.
 const CHUNK = 64;
@@ -421,18 +424,11 @@ pub const Parser = struct {
 const ones: CV = @splat(0xff);
 
 const V16 = @Vector(16, u8);
-/// The NEON and SSSE3 instructions below are called as LLVM intrinsics, which Zig's own
-/// backends (the default for x86_64 debug builds) don't provide.
+/// The NEON instruction below is called as an LLVM intrinsic, which Zig's own backends
+/// (the default for x86_64 debug builds) don't provide.
 const llvm = builtin.zig_backend == .stage2_llvm;
-const has_shuffle = llvm and switch (builtin.cpu.arch) {
-    .aarch64 => true,
-    .x86_64 => builtin.cpu.has(.x86, .ssse3),
-    else => false,
-};
 
 extern fn @"llvm.aarch64.neon.addp.v16i8"(V16, V16) V16;
-extern fn @"llvm.aarch64.neon.tbl1"(V16, V16) V16;
-extern fn @"llvm.x86.ssse3.pshuf.b.128"(V16, V16) V16;
 
 /// Bit i is set when byte i of `v`, all ones or zero, is set. NEON has no movemask, and the
 /// generic lowering of a bool vector bitcast is about three times as long as these pairwise adds.
@@ -450,92 +446,6 @@ inline fn prefixXor(x: u64) u64 {
     var y = x;
     inline for (.{ 1, 2, 4, 8, 16, 32 }) |k| y ^= y << k;
     return y;
-}
-
-/// `table[idx]` per byte, for indices below 16.
-inline fn lookup16(table: V16, idx: V16) V16 {
-    if (builtin.cpu.arch == .aarch64) return @"llvm.aarch64.neon.tbl1"(table, idx);
-    return @"llvm.x86.ssse3.pshuf.b.128"(table, idx);
-}
-
-/// The last `k` bytes of `prev` followed by the first 16 - `k` of `cur`.
-inline fn shiftIn(prev: V16, cur: V16, comptime k: comptime_int) V16 {
-    const mask = comptime blk: {
-        var m: @Vector(16, i32) = undefined;
-        for (0..16) |j| m[j] = if (j < k) 16 - k + j else ~@as(i32, j - k);
-        break :blk m;
-    };
-    return @shuffle(u8, prev, cur, mask);
-}
-
-/// Whether `s` is valid UTF-8, with the lookup algorithm of simdjson (Keiser and Lemire,
-/// "Validating UTF-8 In Less Than One Instruction Per Byte"). Three table lookups on the
-/// nibbles of each byte and the byte before it flag every error that two adjacent bytes
-/// show: a missing or stray continuation byte, an overlong form, a surrogate or a code
-/// point above U+10FFFF. What remains is a continuation byte that a lead two or three bytes
-/// back requires, which a saturating subtraction finds.
-fn validUtf8(s: []const u8) bool {
-    if (!has_shuffle) return std.unicode.utf8ValidateSlice(s);
-    var prev: V16 = @splat(0);
-    var err: V16 = @splat(0);
-    var i: usize = 0;
-    while (i + 16 <= s.len) : (i += 16) {
-        const cur: V16 = s[i..][0..16].*;
-        err |= utf8Errors(prev, cur);
-        prev = cur;
-    }
-    // At least one zero pads the last block, which ends any sequence cut off at the end.
-    var buf: [16]u8 = @splat(0);
-    @memcpy(buf[0 .. s.len - i], s[i..]);
-    err |= utf8Errors(prev, buf);
-    return @reduce(.Max, err) == 0;
-}
-
-fn utf8Errors(prev: V16, cur: V16) V16 {
-    const too_short = 1 << 0; // a lead byte or ASCII followed by a lead byte or ASCII
-    const too_long = 1 << 1; // ASCII followed by a continuation byte
-    const overlong_3 = 1 << 2;
-    const too_large = 1 << 3;
-    const surrogate = 1 << 4;
-    const overlong_2 = 1 << 5;
-    const too_large_1000 = 1 << 6;
-    const overlong_4 = 1 << 6;
-    const two_conts = 1 << 7; // a continuation byte followed by one, unless a lead requires it
-    const carry = too_short | too_long | two_conts;
-
-    const prev1 = shiftIn(prev, cur, 1);
-    const byte_1_high = lookup16(.{
-        too_long,               too_long,  too_long,                           too_long,
-        too_long,               too_long,  too_long,                           too_long,
-        two_conts,              two_conts, two_conts,                          two_conts,
-        too_short | overlong_2, too_short, too_short | overlong_3 | surrogate, too_short | too_large | too_large_1000 | overlong_4,
-    }, prev1 >> @splat(4));
-    const byte_1_low = lookup16(.{
-        carry | overlong_3 | overlong_2 | overlong_4, carry | overlong_2,
-        carry,                                        carry,
-        carry | too_large,                            carry | too_large | too_large_1000,
-        carry | too_large | too_large_1000,           carry | too_large | too_large_1000,
-        carry | too_large | too_large_1000,           carry | too_large | too_large_1000,
-        carry | too_large | too_large_1000,           carry | too_large | too_large_1000,
-        carry | too_large | too_large_1000,           carry | too_large | too_large_1000 | surrogate,
-        carry | too_large | too_large_1000,           carry | too_large | too_large_1000,
-    }, prev1 & @as(V16, @splat(0x0f)));
-    const byte_2_high = lookup16(.{
-        too_short,                                                                    too_short,
-        too_short,                                                                    too_short,
-        too_short,                                                                    too_short,
-        too_short,                                                                    too_short,
-        too_long | overlong_2 | two_conts | overlong_3 | too_large_1000 | overlong_4, too_long | overlong_2 | two_conts | overlong_3 | too_large,
-        too_long | overlong_2 | two_conts | surrogate | too_large,                    too_long | overlong_2 | two_conts | surrogate | too_large,
-        too_short,                                                                    too_short,
-        too_short,                                                                    too_short,
-    }, cur >> @splat(4));
-    const special = byte_1_high & byte_1_low & byte_2_high;
-
-    // Only bytes 111_____ two back and 1111____ three back require a continuation byte here.
-    const third = shiftIn(prev, cur, 2) -| @as(V16, @splat(0xe0 - 0x80));
-    const fourth = shiftIn(prev, cur, 3) -| @as(V16, @splat(0xf0 - 0x80));
-    return ((third | fourth) & @as(V16, @splat(0x80))) ^ special;
 }
 
 pub fn hex4(s: []const u8) ?u16 {
@@ -620,243 +530,11 @@ pub fn decodedEql(raw: []const u8, target: []const u8) bool {
 
 const testing = std.testing;
 
-const VECTOR_LEN = std.simd.suggestVectorLength(u8) orelse 16;
-const V = @Vector(VECTOR_LEN, u8);
-const BoolV = @Vector(VECTOR_LEN, bool);
-const Mask = std.meta.Int(.unsigned, VECTOR_LEN);
+const ReferenceParser = @import("json_reference.zig").ReferenceParser;
 
-inline fn vor(a: BoolV, b: BoolV) BoolV {
-    return @select(bool, a, @as(BoolV, @splat(true)), b);
+test {
+    _ = utf8;
 }
-
-/// Index of the first byte at or after `start` that a string can't simply contain: '"', '\\',
-/// a control character or a non-ASCII byte. `s.len` if there is none.
-fn findSpecial(s: []const u8, start: usize) usize {
-    var i = start;
-    while (i + VECTOR_LEN <= s.len) : (i += VECTOR_LEN) {
-        const c: V = s[i..][0..VECTOR_LEN].*;
-        // Outside 0x20..0x7f exactly when c - 0x20 wraps to 0x60 or more.
-        const m = vor(vor(c == @as(V, @splat('"')), c == @as(V, @splat('\\'))), c -% @as(V, @splat(0x20)) >= @as(V, @splat(0x60)));
-        if (@reduce(.Or, m)) return i + @ctz(@as(Mask, @bitCast(m)));
-    }
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (c == '"' or c == '\\' or c < 0x20 or c >= 0x80) return i;
-    }
-    return i;
-}
-
-/// The single-pass parser that `Parser` replaced, kept to test it against.
-const ReferenceParser = struct {
-    s: []const u8 = &.{},
-    i: usize = 0,
-    trie: *const PathTrie,
-    /// Raw text of the value at each path (strings with their quotes), or null if absent.
-    slots: []?[]const u8,
-    /// One bit per open container while skipping a value: set for objects.
-    stack: [MAX_DEPTH / 64]u64 = undefined,
-
-    /// Validates `line` as a single JSON value (RFC 8259, UTF-8) and fills `slots`. When a
-    /// key repeats, the last occurrence wins. A path through a non-object value is absent.
-    pub fn parse(self: *ReferenceParser, line: []const u8) Error!void {
-        self.s = line;
-        self.i = 0;
-        @memset(self.slots, null);
-        self.ws();
-        try self.tracked(0);
-        self.ws();
-        if (self.i != line.len) return error.Invalid;
-    }
-
-    inline fn cur(self: *const ReferenceParser) Error!u8 {
-        if (self.i >= self.s.len) return error.Invalid;
-        return self.s[self.i];
-    }
-
-    inline fn ws(self: *ReferenceParser) void {
-        while (self.i < self.s.len) : (self.i += 1) {
-            switch (self.s[self.i]) {
-                ' ', '\t', '\r', '\n' => {},
-                else => return,
-            }
-        }
-    }
-
-    /// Parses the value of trie node `n`, descending into the members it has children for.
-    fn tracked(self: *ReferenceParser, n: u32) Error!void {
-        const node = &self.trie.nodes[n];
-        if (node.children.len == 0 or try self.cur() != '{') return self.skipValue();
-        self.i += 1;
-        self.ws();
-        if (try self.cur() == '}') {
-            self.i += 1;
-            return;
-        }
-        while (true) {
-            const key = try self.string();
-            try self.colon();
-            const start = self.i;
-            if (findChild(self.trie, node, key)) |c| {
-                const cn = &self.trie.nodes[c];
-                @memset(self.slots[cn.slot_lo..cn.slot_hi], null);
-                try self.tracked(c);
-                if (cn.slot) |slot| self.slots[slot] = self.s[start..self.i];
-            } else try self.skipValue();
-            self.ws();
-            switch (try self.cur()) {
-                ',' => {
-                    self.i += 1;
-                    self.ws();
-                },
-                '}' => {
-                    self.i += 1;
-                    return;
-                },
-                else => return error.Invalid,
-            }
-        }
-    }
-
-    fn findChild(trie: *const PathTrie, node: *const PathTrie.Node, key: Str) ?u32 {
-        for (node.children) |c| {
-            const seg = trie.nodes[c].seg;
-            if (if (key.escaped) decodedEql(key.raw, seg) else std.mem.eql(u8, key.raw, seg)) return c;
-        }
-        return null;
-    }
-
-    /// After a key: whitespace, ':' and whitespace.
-    inline fn colon(self: *ReferenceParser) Error!void {
-        self.ws();
-        if (try self.cur() != ':') return error.Invalid;
-        self.i += 1;
-        self.ws();
-    }
-
-    /// Validates one value without recursion, so nesting depth doesn't use stack.
-    fn skipValue(self: *ReferenceParser) Error!void {
-        var depth: usize = 0;
-        while (true) {
-            // At the start of a value.
-            const c = try self.cur();
-            switch (c) {
-                '{', '[' => {
-                    self.i += 1;
-                    self.ws();
-                    if (try self.cur() == @as(u8, if (c == '{') '}' else ']')) {
-                        self.i += 1;
-                    } else {
-                        if (depth == MAX_DEPTH) return error.Invalid;
-                        const bit = @as(u64, 1) << @intCast(depth % 64);
-                        if (c == '{') self.stack[depth / 64] |= bit else self.stack[depth / 64] &= ~bit;
-                        depth += 1;
-                        if (c == '{') {
-                            _ = try self.string();
-                            try self.colon();
-                        }
-                        continue;
-                    }
-                },
-                '"' => _ = try self.string(),
-                't' => try self.literal("true"),
-                'f' => try self.literal("false"),
-                'n' => try self.literal("null"),
-                else => try self.number(),
-            }
-            // After a value: close containers until one continues with another element.
-            while (true) {
-                if (depth == 0) return;
-                self.ws();
-                const in_object = self.stack[(depth - 1) / 64] >> @intCast((depth - 1) % 64) & 1 == 1;
-                const d = try self.cur();
-                self.i += 1;
-                if (d == ',') {
-                    self.ws();
-                    if (in_object) {
-                        _ = try self.string();
-                        try self.colon();
-                    }
-                    break;
-                }
-                if (d != @as(u8, if (in_object) '}' else ']')) return error.Invalid;
-                depth -= 1;
-            }
-        }
-    }
-
-    fn literal(self: *ReferenceParser, comptime lit: []const u8) Error!void {
-        if (!std.mem.startsWith(u8, self.s[self.i..], lit)) return error.Invalid;
-        self.i += lit.len;
-    }
-
-    fn digits(s: []const u8, start: usize) usize {
-        var i = start;
-        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
-        return i;
-    }
-
-    fn number(self: *ReferenceParser) Error!void {
-        const s = self.s;
-        var i = self.i;
-        if (i < s.len and s[i] == '-') i += 1;
-        if (i >= s.len) return error.Invalid;
-        if (s[i] == '0') {
-            i += 1;
-        } else if (s[i] >= '1' and s[i] <= '9') {
-            i = digits(s, i);
-        } else return error.Invalid;
-        if (i < s.len and s[i] == '.') {
-            const j = digits(s, i + 1);
-            if (j == i + 1) return error.Invalid;
-            i = j;
-        }
-        if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
-            i += 1;
-            if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
-            const j = digits(s, i);
-            if (j == i) return error.Invalid;
-            i = j;
-        }
-        self.i = i;
-    }
-
-    /// Parses a string at the current position, returning its raw contents.
-    fn string(self: *ReferenceParser) Error!Str {
-        if (try self.cur() != '"') return error.Invalid;
-        const s = self.s;
-        const start = self.i + 1;
-        var i = start;
-        var escaped = false;
-        while (true) {
-            i = findSpecial(s, i);
-            if (i >= s.len) return error.Invalid;
-            const c = s[i];
-            if (c == '"') break;
-            if (c == '\\') {
-                escaped = true;
-                if (i + 1 >= s.len) return error.Invalid;
-                switch (s[i + 1]) {
-                    '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => i += 2,
-                    'u' => {
-                        if (hex4(s[i + 2 ..]) == null) return error.Invalid;
-                        i += 6;
-                    },
-                    else => return error.Invalid,
-                }
-            } else if (c < 0x20) {
-                return error.Invalid;
-            } else {
-                // A run of non-ASCII bytes holds whole UTF-8 sequences.
-                var j = i + 1;
-                while (j < s.len and s[j] >= 0x80) j += 1;
-                if (!std.unicode.utf8ValidateSlice(s[i..j])) return error.Invalid;
-                i = j;
-            }
-        }
-        self.i = i + 1;
-        return .{ .raw = s[start..i], .escaped = escaped };
-    }
-};
 
 fn expectValid(line: []const u8, valid: bool) !void {
     const trie: PathTrie = .{ .nodes = &.{.{ .seg = "", .children = &.{}, .slot = null, .slot_lo = 0, .slot_hi = 0 }}, .slot_count = 0 };
@@ -1030,31 +708,4 @@ test "differential: Parser agrees with the single-pass parser" {
     }
     // The generator must produce enough valid lines for the slots to be compared.
     try testing.expect(valid > 10_000);
-}
-
-test "differential: validUtf8 agrees with std" {
-    var prng = std.Random.DefaultPrng.init(0x7f8);
-    const rand = prng.random();
-    const pieces = [_][]const u8{
-        "a",                "\x7f",         "\xc2\x80",         "\xdf\xbf",         "\xe0\xa0\x80", "\xed\x9f\xbf",
-        "\xee\x80\x80",     "\xef\xbf\xbf", "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf", "\x80",         "\xbf",
-        "\xc0\x80",         "\xc1\xbf",     "\xe0\x80\x80",     "\xed\xa0\x80",     "\xf0\x80\x80", "\xf4\x90\x80\x80",
-        "\xf5\x80\x80\x80", "\xff",         "\xc3",             "\xe2\x82",         "\xf0\x9f\x98",
-    };
-    var buf: [200]u8 = undefined;
-    for (0..100_000) |_| {
-        var n: usize = 0;
-        const count = rand.uintLessThan(usize, 40);
-        for (0..count) |_| {
-            const piece = pieces[rand.uintLessThan(usize, pieces.len)];
-            if (n + piece.len > buf.len) break;
-            @memcpy(buf[n..][0..piece.len], piece);
-            n += piece.len;
-        }
-        const s = buf[0..n];
-        if (validUtf8(s) != std.unicode.utf8ValidateSlice(s)) {
-            std.debug.print("bytes: {x}\n", .{s});
-            return error.TestUnexpectedResult;
-        }
-    }
 }
