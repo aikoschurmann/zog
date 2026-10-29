@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Single source of truth for the version: build.zig.zon.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const exe = b.addExecutable(.{
         .name = "zog",
         .root_module = b.createModule(.{
@@ -12,20 +16,22 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addOptions("build_options", options);
 
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");
 
-    const scanner_tests = b.addTest(.{
+    const tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/scanner.zig"),
+            .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
+    tests.root_module.addOptions("build_options", options);
 
-    const run_scanner_tests = b.addRunArtifact(scanner_tests);
+    const run_tests = b.addRunArtifact(tests);
 
-    test_step.dependOn(&run_scanner_tests.step);
+    test_step.dependOn(&run_tests.step);
 }

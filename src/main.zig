@@ -1,7 +1,8 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Scanner = @import("scanner.zig");
 
-pub const VERSION = "0.1.5";
+pub const VERSION = build_options.version;
 
 pub const MAX_PLUCK_FIELDS = 256;
 
@@ -30,59 +31,110 @@ pub const Config = struct {
     limit: ?usize = null,
     count_only: bool = false,
     header: bool = false,
+    /// Evaluate on the raw bytes only, without the exact parse.
+    fast: bool = false,
+    /// Rule lines out with the byte-level search before parsing. Only turned off by tests.
+    prefilter: bool = true,
+};
+pub const Command = union(enum) {
+    help,
+    version,
+    run: Config,
 };
 
-pub fn main(init: std.process.Init) !void {
+/// Exit codes follow grep: 0 = match found, 1 = no match, 2 = error.
+pub fn main(init: std.process.Init) u8 {
     const io = init.io;
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer if (gpa.deinit() == .leak) std.debug.print("warning: memory leak detected\n", .{});
+    const allocator = init.arena.allocator();
 
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    var args_iter = std.process.Args.Iterator.initAllocator(init.minimal.args, allocator) catch return outOfMemory();
+    _ = args_iter.skip();
+    while (args_iter.next()) |arg| args.append(allocator, arg) catch return outOfMemory();
 
-    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    const config = parseArgs(allocator, &args_iter, io) catch |err| {
-        if (err == error.HelpRequested) std.process.exit(0);
-
+    const command = parseArgs(allocator, args.items) catch |err| {
         const msg = switch (err) {
             error.MissingFileValue => "Error: --file requires a path argument.",
             error.MissingLimitValue => "Error: --limit requires a number.",
+            error.InvalidLimit => "Error: --limit must be a non-negative integer.",
             error.MissingFormatValue => "Error: --format requires 'json', 'csv', or 'tsv'.",
             error.InvalidCondition => "Error: Incomplete WHERE condition. Use <key> <op> <val>.",
             error.UnknownOperator => "Error: Invalid operator. Supported: eq, neq, gt, lt, gte, lte, has, exists, in.",
+            error.UnknownOption => "Error: Unknown option. Put '--' before query terms that start with '--'.",
             error.MissingArguments => "Error: No query provided. You must provide a search condition or a SELECT clause.",
             error.TooManyPluckFields => "Error: Too many SELECT fields (max 256).",
+            error.InvalidSelectField => "Error: Aggregation needs a field name (e.g. sum:balance).",
             error.InvalidFormat => "Error: --format must be 'json', 'csv', or 'tsv'.",
-            else => "Error parsing arguments.",
+            error.OutOfMemory => return outOfMemory(),
         };
         std.debug.print("{s}\n\n", .{msg});
         printUsage();
-        std.process.exit(1);
+        return 2;
+    };
+
+    const config = switch (command) {
+        .help => {
+            printUsage();
+            return 0;
+        },
+        .version => {
+            var ver_buf: [64]u8 = undefined;
+            var ver_writer = std.Io.File.stdout().writerStreaming(io, &ver_buf);
+            ver_writer.interface.print("zog v{s}\n", .{VERSION}) catch {};
+            ver_writer.interface.flush() catch {};
+            return 0;
+        },
+        .run => |c| c,
     };
 
     if (config.file_path == null) {
-        if (try std.Io.File.stdin().isTty(io)) {
+        if (std.Io.File.stdin().isTty(io) catch false) {
             std.debug.print("Error: No input file specified and no data piped to stdin.\n", .{});
             std.debug.print("Provide a file with '--file <path>' or pipe data: 'cat logs.jsonl | zog ...'\n", .{});
             std.debug.print("Run 'zog --help' for usage information.\n", .{});
-            std.process.exit(1);
+            return 2;
         }
     }
 
     var stdout_buffer: [128 * 1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    // Streaming rather than positional, so `zog ... >> out` appends instead of overwriting
+    // the file from offset 0.
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    if (config.file_path) |_| {
-        const matched = try Scanner.searchFile(allocator, config, stdout, io);
-        stdout.flush() catch {};
-        if (matched == 0) std.process.exit(1);
-    } else {
-        const matched = try Scanner.searchStream(allocator, config, stdout, io);
-        stdout.flush() catch {};
-        if (matched == 0) std.process.exit(1);
-    }
+    const matched = runQuery(allocator, config, stdout, io) catch |err| {
+        switch (err) {
+            error.WriteFailed => {
+                const write_err = stdout_writer.err orelse error.WriteFailed;
+                // The reader went away (e.g. `zog ... | head -1`): not an error for us.
+                if (write_err == error.BrokenPipe) return 0;
+                std.debug.print("zog: write error: {s}\n", .{@errorName(write_err)});
+            },
+            error.NonNumericComparison => std.debug.print("zog: gt, lt, gte and lte need a numeric value.\n", .{}),
+            error.InvalidKey => std.debug.print("zog: keys can't be empty or have empty path segments.\n", .{}),
+            error.FileNotFound => std.debug.print("zog: {s}: No such file\n", .{config.file_path.?}),
+            else => if (config.file_path) |path|
+                std.debug.print("zog: {s}: {s}\n", .{ path, @errorName(err) })
+            else
+                std.debug.print("zog: {s}\n", .{@errorName(err)}),
+        }
+        return 2;
+    };
+    return if (matched == 0) 1 else 0;
+}
+
+fn runQuery(allocator: std.mem.Allocator, config: Config, stdout: *std.Io.Writer, io: std.Io) !usize {
+    const matched = if (config.file_path != null)
+        try Scanner.searchFile(allocator, config, stdout, io)
+    else
+        try Scanner.searchStream(allocator, config, stdout, io);
+    try stdout.flush();
+    return matched;
+}
+
+fn outOfMemory() u8 {
+    std.debug.print("zog: out of memory\n", .{});
+    return 2;
 }
 
 fn printUsage() void {
@@ -97,20 +149,25 @@ fn printUsage() void {
         \\  --count, -c         Print only the count of matching lines
         \\  --header            Print column header row (for TSV/CSV with SELECT)
         \\  --limit <n>         Stop after n matches
+        \\  --fast              Match on raw bytes only: faster, but approximate (keys at any depth,
+        \\                      no escape decoding, no validation)
         \\  --help, -h          Show this help message
         \\  --version, -v       Show version
+        \\  --                  Treat all following arguments as query terms
         \\
         \\Query Syntax:
         \\  Operators: eq, neq, gt, lt, gte, lte, has, exists, in
         \\  Types:     Auto-detected. Use 's:' for strings or 'n:' for numbers to force types.
         \\  NOT:       Negate any condition with NOT before the key  (e.g. NOT level eq debug)
         \\  exists:    Check key presence only, no value needed       (e.g. error exists)
+        \\  Paths:     Keys are top-level; use dots for nested keys   (e.g. user.id eq 5, a\.b for a literal dot)
         \\  AND / OR:  Chain conditions                               (e.g. level eq error AND code gt 500)
         \\  Aggregations: count:field, sum:field, min:field, max:field, avg:field
         \\
         \\Exit Codes:
         \\  0  At least one match found
         \\  1  No matches found
+        \\  2  Error
         \\
         \\Examples:
         \\  zog --file logs.jsonl level eq error
@@ -162,6 +219,7 @@ fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, s
                     ptype = .avg;
                     key = p[4..];
                 }
+                if (key.len == 0) return error.InvalidSelectField;
 
                 try pluck_keys.append(allocator, .{ .key = key, .ptype = ptype, .original_str = p });
             }
@@ -188,7 +246,7 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
 
     while (i < tokens.len) {
         if (std.ascii.eqlIgnoreCase(tokens[i], "not")) {
-            negated = true;
+            negated = !negated;
             i += 1;
             continue;
         }
@@ -218,42 +276,54 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
             } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
                 return error.InvalidCondition;
             }
+            // A trailing AND/OR with nothing after it is an incomplete condition.
+            if (i == tokens.len) return error.InvalidCondition;
         }
     }
 
+    if (negated) return error.InvalidCondition;
     if (current_conditions.items.len > 0) try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
     return groups.toOwnedSlice(allocator);
 }
 
-fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, io: std.Io) !Config {
-    _ = args_iter.skip();
-
+pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Command {
     // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
     var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
     var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
 
-    while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--file")) {
-            config.file_path = try allocator.dupe(u8, args_iter.next() orelse return error.MissingFileValue);
+    var a: usize = 0;
+    while (a < args.len) : (a += 1) {
+        const arg = args[a];
+        if (std.mem.eql(u8, arg, "--")) {
+            try tokens.appendSlice(allocator, args[a + 1 ..]);
+            break;
+        } else if (std.mem.eql(u8, arg, "--file")) {
+            a += 1;
+            if (a == args.len) return error.MissingFileValue;
+            config.file_path = args[a];
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            const lim_str = args_iter.next() orelse return error.MissingLimitValue;
-            config.limit = try std.fmt.parseInt(usize, lim_str, 10);
+            a += 1;
+            if (a == args.len) return error.MissingLimitValue;
+            config.limit = std.fmt.parseInt(usize, args[a], 10) catch return error.InvalidLimit;
         } else if (std.mem.eql(u8, arg, "--format")) {
-            const fmt_str = args_iter.next() orelse return error.MissingFormatValue;
+            a += 1;
+            if (a == args.len) return error.MissingFormatValue;
+            const fmt_str = args[a];
             if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return error.HelpRequested;
+            return .help;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            var ver_buf: [64]u8 = undefined;
-            var ver_writer = std.Io.File.stdout().writer(io, &ver_buf);
-            ver_writer.interface.print("zog v{s}\n", .{VERSION}) catch {};
-            std.process.exit(0);
+            return .version;
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;
         } else if (std.mem.eql(u8, arg, "--header")) {
             config.header = true;
+        } else if (std.mem.eql(u8, arg, "--fast")) {
+            config.fast = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownOption;
         } else {
-            try tokens.append(allocator, try allocator.dupe(u8, arg));
+            try tokens.append(allocator, arg);
         }
     }
 
@@ -270,5 +340,35 @@ fn parseArgs(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
 
     // Ensure that some action (filtering, plucking, or counting) was requested
     if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) return error.MissingArguments;
-    return config;
+    return .{ .run = config };
+}
+
+test {
+    _ = Scanner;
+}
+
+test "parseArgs flags and errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectError(error.InvalidLimit, parseArgs(a, &.{ "--limit", "x", "a", "exists" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(a, &.{ "--lmit", "5", "a", "exists" }));
+    try std.testing.expectError(error.InvalidSelectField, parseArgs(a, &.{ "SELECT", "sum:" }));
+    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "a", "exists", "AND" }));
+    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "a", "exists", "AND", "NOT" }));
+    try std.testing.expectError(error.MissingArguments, parseArgs(a, &.{}));
+    try std.testing.expectEqual(Command.help, try parseArgs(a, &.{ "a", "--help" }));
+
+    // `--` lets query terms start with dashes; negative numbers never needed it.
+    const dashed = (try parseArgs(a, &.{ "--", "--weird", "eq", "--x" })).run;
+    try std.testing.expectEqualStrings("--weird", dashed.groups[0].conditions[0].key);
+    const negative = (try parseArgs(a, &.{ "balance", "gt", "-5" })).run;
+    try std.testing.expectEqualStrings("-5", negative.groups[0].conditions[0].val);
+
+    const not_not = (try parseArgs(a, &.{ "NOT", "NOT", "a", "exists" })).run;
+    try std.testing.expect(!not_not.groups[0].conditions[0].negated);
+
+    const limit0 = (try parseArgs(a, &.{ "--limit", "0", "a", "exists" })).run;
+    try std.testing.expectEqual(@as(?usize, 0), limit0.limit);
 }
