@@ -6,12 +6,6 @@ const finder = @import("finder.zig");
 const values = @import("values.zig");
 const output = @import("output.zig");
 
-const KeyFinder = finder.KeyFinder;
-const MultiFinder = finder.MultiFinder;
-const Hazards = finder.Hazards;
-const Needle = finder.Needle;
-const parseFastInt = values.parseFastInt;
-const parseNumber = values.parseNumber;
 const jsonEscapeAlloc = output.jsonEscapeAlloc;
 
 pub const TypeForced = enum { none, string, numeric };
@@ -28,7 +22,7 @@ pub const Literal = struct {
 
 pub const CompiledCondition = struct {
     /// Finds the last key of the path, at any depth.
-    finder: KeyFinder,
+    finder: finder.KeyFinder,
     /// Slot of the key path in the exact parser.
     slot: u32,
     val: Literal,
@@ -41,7 +35,7 @@ pub const CompiledCondition = struct {
 pub const CompiledGroup = struct { conditions: []CompiledCondition };
 
 pub const CompiledPluck = struct {
-    finder: KeyFinder,
+    finder: finder.KeyFinder,
     slot: u32,
     ptype: cli.PluckType,
     original_str: []const u8,
@@ -56,7 +50,7 @@ pub const CompiledPlan = struct {
     /// has no usable anchor.
     anchors: []const *const CompiledCondition,
     /// The distinct anchor keys, searched for together in one pass.
-    anchor_finder: MultiFinder,
+    anchor_finder: finder.MultiFinder,
     /// Index into `anchor_finder.finders` of each anchor's key.
     anchor_keys: []const usize,
     pluck: []CompiledPluck,
@@ -67,7 +61,7 @@ pub const CompiledPlan = struct {
     /// Exact mode only: parse every line instead of prefiltering. For testing the prefilter.
     prefilter: bool,
     trie: json.PathTrie,
-    hazards: Hazards,
+    hazards: finder.Hazards,
     format: cli.OutputFormat,
     limit: ?usize,
     count_only: bool,
@@ -77,160 +71,252 @@ pub const CompiledPlan = struct {
 /// Splits a key into the path of object keys it names: `a.b` is key `b` inside `a`. `\.`
 /// is a literal dot and `\\` a backslash.
 fn splitPath(allocator: std.mem.Allocator, key: []const u8) ![]const []const u8 {
-    var segs: std.ArrayListUnmanaged([]const u8) = .empty;
-    var seg: std.ArrayListUnmanaged(u8) = .empty;
-    var i: usize = 0;
-    while (i < key.len) : (i += 1) {
-        const c = key[i];
-        if (c == '\\' and i + 1 < key.len and (key[i + 1] == '.' or key[i + 1] == '\\')) {
-            i += 1;
-            try seg.append(allocator, key[i]);
-        } else if (c == '.') {
-            if (seg.items.len == 0) return error.InvalidKey;
-            try segs.append(allocator, try seg.toOwnedSlice(allocator));
-        } else try seg.append(allocator, c);
+    var segments: std.ArrayList([]const u8) = .empty;
+    var segment: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+
+    while (pos < key.len) : (pos += 1) {
+        const byte = key[pos];
+        if (byte == '\\' and pos + 1 < key.len and (key[pos + 1] == '.' or key[pos + 1] == '\\')) {
+            // An escaped dot or backslash is part of the segment's text.
+            pos += 1;
+            try segment.append(allocator, key[pos]);
+        } else if (byte == '.') {
+            // A segment must not be empty, which rules out `a..b`, `.a` and `a.`.
+            if (segment.items.len == 0) return error.InvalidKey;
+            try segments.append(allocator, try segment.toOwnedSlice(allocator));
+        } else {
+            try segment.append(allocator, byte);
+        }
     }
-    if (seg.items.len == 0) return error.InvalidKey;
-    try segs.append(allocator, try seg.toOwnedSlice(allocator));
-    return segs.toOwnedSlice(allocator);
+
+    if (segment.items.len == 0) return error.InvalidKey;
+    try segments.append(allocator, try segment.toOwnedSlice(allocator));
+    return segments.toOwnedSlice(allocator);
 }
 
 fn compileLiteral(allocator: std.mem.Allocator, text: []const u8) !Literal {
     return .{
         .quoted = try jsonEscapeAlloc(allocator, text, true),
         .text = try allocator.dupe(u8, text),
-        .num = parseNumber(text),
-        .int = parseFastInt(text),
+        .num = values.parseNumber(text),
+        .int = values.parseFastInt(text),
     };
 }
 
-pub fn compilePlan(allocator: std.mem.Allocator, config: cli.Config) !CompiledPlan {
-    var comp_groups = try allocator.alloc(CompiledGroup, config.groups.len);
-    // Every condition's path, then every pluck's, for the exact parser.
-    var paths: std.ArrayListUnmanaged([]const []const u8) = .empty;
-    var hazards: Hazards = .{};
-
-    for (config.groups, 0..) |g, i| {
-        var comp_conds = try allocator.alloc(CompiledCondition, g.conditions.len);
-        for (g.conditions, 0..) |c, j| {
-            var actual_val = c.val;
-            var type_forced: TypeForced = .none;
-            if (std.mem.startsWith(u8, actual_val, "s:")) {
-                actual_val = actual_val[2..];
-                type_forced = .string;
-            } else if (std.mem.startsWith(u8, actual_val, "n:") or std.mem.startsWith(u8, actual_val, "b:")) {
-                actual_val = actual_val[2..];
-                type_forced = .numeric;
-            }
-
-            var in_vals: std.ArrayListUnmanaged(Literal) = .empty;
-            if (c.op == .in_op) {
-                var it = std.mem.splitScalar(u8, actual_val, ',');
-                while (it.next()) |v| {
-                    if (v.len > 0) try in_vals.append(allocator, try compileLiteral(allocator, v));
-                }
-            }
-
-            const val = try compileLiteral(allocator, actual_val);
-            switch (c.op) {
-                .gt, .lt, .gte, .lte => if (val.num == null) return error.NonNumericComparison,
-                else => {},
-            }
-
-            const path = try splitPath(allocator, c.key);
-            try paths.append(allocator, path);
-            // The prefilter searches for the keys of positive conditions.
-            if (!c.negated) hazards.add(path[path.len - 1]);
-            comp_conds[j] = .{
-                .finder = .init(try jsonEscapeAlloc(allocator, path[path.len - 1], true)),
-                .slot = undefined,
-                .val = val,
-                .op = c.op,
-                .type_forced = type_forced,
-                .negated = c.negated,
-                .in_vals = try in_vals.toOwnedSlice(allocator),
-            };
-        }
-        comp_groups[i] = .{ .conditions = comp_conds };
+/// Compiles one `[NOT] key op value` condition. Its key path is appended to `paths` for the
+/// exact parser, and a positive condition's key is registered as a hazard.
+fn compileCondition(
+    allocator: std.mem.Allocator,
+    condition: cli.Condition,
+    paths: *std.ArrayList([]const []const u8),
+    hazards: *finder.Hazards,
+) !CompiledCondition {
+    // `s:` forces a string comparison. `n:` and `b:` forbid strings, so the condition only
+    // matches non-string JSON values. Without a prefix the type is detected from the line.
+    var raw_value = condition.val;
+    var type_forced: TypeForced = .none;
+    if (std.mem.startsWith(u8, raw_value, "s:")) {
+        raw_value = raw_value[2..];
+        type_forced = .string;
+    } else if (std.mem.startsWith(u8, raw_value, "n:") or std.mem.startsWith(u8, raw_value, "b:")) {
+        raw_value = raw_value[2..];
+        type_forced = .numeric;
     }
 
+    // `in` takes a comma-separated list. Empty items, as in `a,,b`, are ignored.
+    var in_vals: std.ArrayList(Literal) = .empty;
+    if (condition.op == .in_op) {
+        var items = std.mem.splitScalar(u8, raw_value, ',');
+        while (items.next()) |item| {
+            if (item.len > 0) try in_vals.append(allocator, try compileLiteral(allocator, item));
+        }
+    }
+
+    const val = try compileLiteral(allocator, raw_value);
+    // Ordering comparisons only make sense against a number.
+    switch (condition.op) {
+        .gt, .lt, .gte, .lte => {
+            if (val.num == null) return error.NonNumericComparison;
+        },
+        else => {},
+    }
+
+    const path = try splitPath(allocator, condition.key);
+    try paths.append(allocator, path);
+    const key = path[path.len - 1];
+    // The keys of positive conditions are registered as hazards, so that escapes which
+    // could hide them are detected.
+    if (!condition.negated) hazards.add(key);
+
+    return .{
+        .finder = .init(try jsonEscapeAlloc(allocator, key, true)),
+        .slot = undefined,
+        .val = val,
+        .op = condition.op,
+        .type_forced = type_forced,
+        .negated = condition.negated,
+        .in_vals = try in_vals.toOwnedSlice(allocator),
+    };
+}
+
+/// Compiles the WHERE groups. Conditions are appended to `paths` in group order.
+fn compileGroups(
+    allocator: std.mem.Allocator,
+    groups: []const cli.ConditionGroup,
+    paths: *std.ArrayList([]const []const u8),
+    hazards: *finder.Hazards,
+) ![]CompiledGroup {
+    const compiled = try allocator.alloc(CompiledGroup, groups.len);
+
+    for (groups, 0..) |group, group_index| {
+        const conditions = try allocator.alloc(CompiledCondition, group.conditions.len);
+        for (group.conditions, 0..) |condition, condition_index| {
+            conditions[condition_index] = try compileCondition(allocator, condition, paths, hazards);
+        }
+        compiled[group_index] = .{ .conditions = conditions };
+    }
+    return compiled;
+}
+
+/// Picks one anchor per OR group: a positive condition that every line matching the group
+/// must pass. Returns an empty slice when some group has no usable anchor.
+fn pickAnchors(allocator: std.mem.Allocator, groups: []const CompiledGroup) ![]const *const CompiledCondition {
     // A match satisfies some group, and every operator requires its key to be present, so
     // a line can only match if one group's non-negated condition passes on it. A group of
     // only negated conditions can match any line, which rules out anchoring.
-    var anchors = try allocator.alloc(*const CompiledCondition, comp_groups.len);
-    for (comp_groups, 0..) |*g, gi| {
+    const anchors = try allocator.alloc(*const CompiledCondition, groups.len);
+
+    for (groups, anchors) |group, *anchor| {
         var best: ?*const CompiledCondition = null;
-        for (g.conditions) |*c| {
-            if (!c.negated and (best == null or anchorScore(c) > anchorScore(best.?))) best = c;
+        for (group.conditions) |*condition| {
+            if (condition.negated) continue;
+            if (best == null or anchorScore(condition) > anchorScore(best.?)) best = condition;
         }
-        anchors[gi] = best orelse {
-            anchors = &.{};
-            break;
-        };
+        anchor.* = best orelse return &.{};
     }
-    var needles = std.array_list.Managed(Needle).init(allocator);
+    return anchors;
+}
+
+/// Whether two needles run the same search: the same key, and both or neither searching a
+/// value of it.
+fn sameNeedle(first: finder.Needle, second: finder.Needle) bool {
+    const same_key = std.mem.eql(u8, first.finder.key, second.finder.key);
+    const same_value_of = std.mem.eql(u8, first.value_of orelse "", second.value_of orelse "");
+    const both_or_neither = (first.value_of == null) == (second.value_of == null);
+    return same_key and same_value_of and both_or_neither;
+}
+
+/// Turns each anchor into a needle and returns, per anchor, the index of its needle in
+/// `needles`. Anchors sharing a needle are searched for once.
+fn collectNeedles(
+    allocator: std.mem.Allocator,
+    anchors: []const *const CompiledCondition,
+    needles: *std.ArrayList(finder.Needle),
+    hazards: *finder.Hazards,
+) ![]usize {
     const anchor_keys = try allocator.alloc(usize, anchors.len);
-    for (anchors, anchor_keys) |a, *ki| {
-        const needle: Needle = if (searchesValue(a)) blk: {
-            hazards.add(a.val.text);
-            break :blk .{ .finder = .init(a.val.quoted), .value_of = a.finder.key };
-        } else .{ .finder = a.finder };
-        ki.* = for (needles.items, 0..) |n, j| {
-            if (std.mem.eql(u8, n.finder.key, needle.finder.key) and
-                std.mem.eql(u8, n.value_of orelse "", needle.value_of orelse "") and
-                (n.value_of == null) == (needle.value_of == null)) break j;
+
+    for (anchors, anchor_keys) |anchor, *anchor_key| {
+        // A value anchor searches for the quoted value and then checks that the value
+        // belongs to its key. The value's text is a hazard, like a key.
+        const needle: finder.Needle = if (searchesValue(anchor)) blk: {
+            hazards.add(anchor.val.text);
+            break :blk .{ .finder = .init(anchor.val.quoted), .value_of = anchor.finder.key };
+        } else .{ .finder = anchor.finder };
+
+        anchor_key.* = for (needles.items, 0..) |existing, index| {
+            if (sameNeedle(existing, needle)) break index;
         } else blk: {
-            try needles.append(needle);
+            try needles.append(allocator, needle);
             break :blk needles.items.len - 1;
         };
     }
+    return anchor_keys;
+}
 
-    var pks = try allocator.alloc(CompiledPluck, config.pluck.len);
-    var has_aggs = false;
-    for (config.pluck, 0..) |p, i| {
-        const path = try splitPath(allocator, p.key);
+/// Compiles the SELECT fields. Their paths are appended to `paths` after the conditions'.
+fn compilePlucks(
+    allocator: std.mem.Allocator,
+    plucks: []const cli.PluckField,
+    paths: *std.ArrayList([]const []const u8),
+) ![]CompiledPluck {
+    const compiled = try allocator.alloc(CompiledPluck, plucks.len);
+
+    for (plucks, 0..) |pluck, index| {
+        const path = try splitPath(allocator, pluck.key);
         try paths.append(allocator, path);
         const key_quoted = try jsonEscapeAlloc(allocator, path[path.len - 1], true);
+
+        // A repeated key reuses the value extracted for its first occurrence, whatever the
+        // aggregation of either field.
         var same_as: ?usize = null;
-        for (pks[0..i], 0..) |prev, j| {
-            if (std.mem.eql(u8, prev.finder.key, key_quoted)) {
-                same_as = j;
+        for (compiled[0..index], 0..) |previous, earlier_index| {
+            if (std.mem.eql(u8, previous.finder.key, key_quoted)) {
+                same_as = earlier_index;
                 break;
             }
         }
-        pks[i] = .{
+
+        compiled[index] = .{
             .finder = .init(key_quoted),
             .slot = undefined,
-            .ptype = p.ptype,
-            .original_str = p.original_str,
+            .ptype = pluck.ptype,
+            .original_str = pluck.original_str,
             .same_as = same_as,
         };
-        if (p.ptype != .raw) has_aggs = true;
     }
+    return compiled;
+}
 
-    const path_slots = try allocator.alloc(u32, paths.items.len);
-    const trie = try json.PathTrie.init(allocator, paths.items, path_slots);
+/// Hands each condition and pluck the slot the trie gave its path. The paths were appended
+/// conditions first (group by group), then plucks, and the slots follow that order.
+fn assignSlots(groups: []CompiledGroup, plucks: []CompiledPluck, path_slots: []const u32) void {
     var next_path: usize = 0;
-    for (comp_groups) |g| {
-        for (g.conditions) |*c| {
-            c.slot = path_slots[next_path];
+
+    for (groups) |group| {
+        for (group.conditions) |*condition| {
+            condition.slot = path_slots[next_path];
             next_path += 1;
         }
     }
-    for (pks) |*p| {
-        p.slot = path_slots[next_path];
+    for (plucks) |*pluck| {
+        pluck.slot = path_slots[next_path];
         next_path += 1;
     }
+}
 
-    var anchor_finder: MultiFinder = try .init(allocator, needles.items);
+pub fn compilePlan(allocator: std.mem.Allocator, config: cli.Config) !CompiledPlan {
+    // Every condition's path, then every pluck's, for the exact parser.
+    var paths: std.ArrayList([]const []const u8) = .empty;
+    var hazards: finder.Hazards = .{};
+
+    const groups = try compileGroups(allocator, config.groups, &paths, &hazards);
+    const anchors = try pickAnchors(allocator, groups);
+
+    var needles: std.ArrayList(finder.Needle) = .empty;
+    const anchor_keys = try collectNeedles(allocator, anchors, &needles, &hazards);
+
+    const plucks = try compilePlucks(allocator, config.pluck, &paths);
+    // An aggregation in SELECT (count, sum, ...) makes the query compute running totals.
+    const has_aggregations = for (config.pluck) |pluck| {
+        if (pluck.ptype != .raw) break true;
+    } else false;
+
+    const path_slots = try allocator.alloc(u32, paths.items.len);
+    const trie = try json.PathTrie.init(allocator, paths.items, path_slots);
+    assignSlots(groups, plucks, path_slots);
+
+    var anchor_finder: finder.MultiFinder = try .init(allocator, needles.items);
     anchor_finder.hazards = hazards;
+
     return CompiledPlan{
-        .groups = comp_groups,
+        .groups = groups,
         .anchors = anchors,
         .anchor_finder = anchor_finder,
         .anchor_keys = anchor_keys,
-        .pluck = pks,
-        .has_aggregations = has_aggs,
+        .pluck = plucks,
+        .has_aggregations = has_aggregations,
         .exact = !config.fast,
         .prefilter = config.prefilter,
         .trie = trie,
@@ -245,15 +331,22 @@ pub fn compilePlan(allocator: std.mem.Allocator, config: cli.Config) !CompiledPl
 /// Whether an anchor is found by searching for its value rather than its key. A string
 /// `eq` value is usually far rarer than its key (`"GollumEvent"` vs `"type"`). Values that
 /// could also match a number or literal are excluded.
-fn searchesValue(c: *const CompiledCondition) bool {
-    if (c.op != .eq or c.type_forced == .numeric or c.val.quoted.len < 3) return false;
-    if (c.type_forced == .string) return true;
-    const v = c.val.text;
-    return c.val.num == null and !std.mem.eql(u8, v, "true") and
-        !std.mem.eql(u8, v, "false") and !std.mem.eql(u8, v, "null");
+fn searchesValue(condition: *const CompiledCondition) bool {
+    if (condition.op != .eq or condition.type_forced == .numeric or condition.val.quoted.len < 3) {
+        return false;
+    }
+    if (condition.type_forced == .string) return true;
+
+    const text = condition.val.text;
+    return condition.val.num == null and
+        !std.mem.eql(u8, text, "true") and
+        !std.mem.eql(u8, text, "false") and
+        !std.mem.eql(u8, text, "null");
 }
 
 /// Prefers value anchors, then the longest needle: it yields the fewest SIMD candidates.
-fn anchorScore(c: *const CompiledCondition) usize {
-    return if (searchesValue(c)) 1000 + c.val.quoted.len else c.finder.key.len;
+/// The 1000 offset ranks value anchors above key anchors.
+fn anchorScore(condition: *const CompiledCondition) usize {
+    if (searchesValue(condition)) return 1000 + condition.val.quoted.len;
+    return condition.finder.key.len;
 }

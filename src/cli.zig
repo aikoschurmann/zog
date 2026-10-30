@@ -1,7 +1,7 @@
 //! Command-line parsing: options and the query (SELECT fields, WHERE conditions).
 const std = @import("std");
 
-pub const MAX_PLUCK_FIELDS = 256;
+pub const max_pluck_fields = 256;
 
 pub const Operator = enum { eq, neq, gt, lt, gte, lte, has, exists, in_op };
 pub const Condition = struct {
@@ -41,7 +41,7 @@ pub const Command = union(enum) {
 
 pub fn printUsage() void {
     std.debug.print(
-        \\zog - Blisteringly fast JSONL search engine
+        \\zog - search JSONL with SIMD
         \\
         \\Usage: zog [--file <path>] [--format json|csv|tsv] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
         \\
@@ -93,125 +93,146 @@ fn parseOp(op_str: []const u8) ?Operator {
     return null;
 }
 
-fn parseSelectClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) !struct { fields: []PluckField, next_i: usize } {
-    var pluck_keys: std.ArrayListUnmanaged(PluckField) = .empty;
-    var i = start;
-    const select_start_idx = i;
+const SelectClause = struct {
+    fields: []PluckField,
+    /// Token index just after the SELECT clause, including the WHERE keyword if present.
+    next_token: usize,
+};
 
-    while (i < tokens.len and !std.ascii.eqlIgnoreCase(tokens[i], "where")) {
-        var it = std.mem.splitScalar(u8, tokens[i], ',');
-        while (it.next()) |p| {
-            if (p.len > 0) {
-                var ptype: PluckType = .raw;
-                var key = p;
+/// Parses the comma-separated fields after SELECT, up to WHERE or the end of the tokens.
+/// A field is a key, or an aggregation such as `sum:balance`.
+fn parseSelectClause(
+    allocator: std.mem.Allocator,
+    tokens: []const []const u8,
+    start: usize,
+) !SelectClause {
+    var pluck_keys: std.ArrayList(PluckField) = .empty;
+    var token_index = start;
 
-                if (std.ascii.startsWithIgnoreCase(p, "count:")) {
-                    ptype = .count;
-                    key = p[6..];
-                } else if (std.ascii.startsWithIgnoreCase(p, "sum:")) {
-                    ptype = .sum;
-                    key = p[4..];
-                } else if (std.ascii.startsWithIgnoreCase(p, "min:")) {
-                    ptype = .min;
-                    key = p[4..];
-                } else if (std.ascii.startsWithIgnoreCase(p, "max:")) {
-                    ptype = .max;
-                    key = p[4..];
-                } else if (std.ascii.startsWithIgnoreCase(p, "avg:")) {
-                    ptype = .avg;
-                    key = p[4..];
-                }
-                if (key.len == 0) return error.InvalidSelectField;
+    while (token_index < tokens.len and !std.ascii.eqlIgnoreCase(tokens[token_index], "where")) : (token_index += 1) {
+        var fields = std.mem.splitScalar(u8, tokens[token_index], ',');
+        while (fields.next()) |field| {
+            // Empty items, as in `name,,age`, are skipped.
+            if (field.len == 0) continue;
 
-                try pluck_keys.append(allocator, .{ .key = key, .ptype = ptype, .original_str = p });
-            }
+            const ptype, const key = parseSelectField(field);
+            if (key.len == 0) return error.InvalidSelectField;
+            try pluck_keys.append(allocator, .{ .key = key, .ptype = ptype, .original_str = field });
         }
-        i += 1;
     }
 
-    // SELECT was present but no fields were listed before WHERE / end of input
-    if (i == select_start_idx) return error.MissingArguments;
+    // SELECT with no fields before WHERE or the end.
+    if (token_index == start) return error.MissingArguments;
 
-    // Consume the optional WHERE keyword
-    if (i < tokens.len and std.ascii.eqlIgnoreCase(tokens[i], "where")) i += 1;
+    if (token_index < tokens.len and std.ascii.eqlIgnoreCase(tokens[token_index], "where")) {
+        token_index += 1;
+    }
 
     const fields = try pluck_keys.toOwnedSlice(allocator);
-    if (fields.len > MAX_PLUCK_FIELDS) return error.TooManyPluckFields;
-    return .{ .fields = fields, .next_i = i };
+    if (fields.len > max_pluck_fields) return error.TooManyPluckFields;
+    return .{ .fields = fields, .next_token = token_index };
 }
 
-fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
-    var groups: std.ArrayListUnmanaged(ConditionGroup) = .empty;
-    var current_conditions: std.ArrayListUnmanaged(Condition) = .empty;
-    var negated = false;
-    var i = start;
+/// Splits an aggregation prefix (`count:`, `sum:`, ...) off a SELECT field.
+fn parseSelectField(field: []const u8) struct { PluckType, []const u8 } {
+    inline for (.{ .count, .sum, .min, .max, .avg }) |ptype| {
+        const prefix = @tagName(ptype) ++ ":";
+        if (std.ascii.startsWithIgnoreCase(field, prefix)) return .{ ptype, field[prefix.len..] };
+    }
+    return .{ .raw, field };
+}
 
-    while (i < tokens.len) {
-        if (std.ascii.eqlIgnoreCase(tokens[i], "not")) {
+/// Parses `[NOT] <key> <op> [<val>]` conditions joined by AND / OR. AND binds tighter, so
+/// the result is a list of OR'ed groups whose conditions are AND'ed.
+fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
+    var groups: std.ArrayList(ConditionGroup) = .empty;
+    var current_conditions: std.ArrayList(Condition) = .empty;
+    // NOT toggles instead of setting, so `NOT NOT key` cancels out. The flag applies only to
+    // the next condition.
+    var negated = false;
+    var token_index = start;
+
+    while (token_index < tokens.len) {
+        if (std.ascii.eqlIgnoreCase(tokens[token_index], "not")) {
             negated = !negated;
-            i += 1;
+            token_index += 1;
             continue;
         }
 
-        if (i + 1 >= tokens.len) return error.InvalidCondition;
-        const key = tokens[i];
-        const op = parseOp(tokens[i + 1]) orelse return error.UnknownOperator;
-        var val: []const u8 = "";
+        // A key must be followed by an operator.
+        if (token_index + 1 >= tokens.len) return error.InvalidCondition;
+        const key = tokens[token_index];
+        const op = parseOp(tokens[token_index + 1]) orelse return error.UnknownOperator;
 
+        var val: []const u8 = "";
         if (op != .exists) {
-            if (i + 2 >= tokens.len) return error.InvalidCondition;
-            val = tokens[i + 2];
-            i += 3;
+            // Every operator except `exists` takes a value.
+            if (token_index + 2 >= tokens.len) return error.InvalidCondition;
+            val = tokens[token_index + 2];
+            token_index += 3;
         } else {
-            i += 2;
+            token_index += 2;
         }
 
         try current_conditions.append(allocator, .{ .key = key, .val = val, .op = op, .negated = negated });
         negated = false;
 
-        if (i < tokens.len) {
-            const logical = tokens[i];
-            i += 1;
+        // A condition is followed by AND, by OR, or by the end of the tokens.
+        if (token_index < tokens.len) {
+            const logical = tokens[token_index];
+            token_index += 1;
             if (std.ascii.eqlIgnoreCase(logical, "or")) {
+                // OR closes the current AND group. The group becomes one alternative.
                 try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
                 current_conditions = .empty;
             } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
                 return error.InvalidCondition;
             }
+
             // A trailing AND/OR with nothing after it is an incomplete condition.
-            if (i == tokens.len) return error.InvalidCondition;
+            if (token_index == tokens.len) return error.InvalidCondition;
         }
     }
 
+    // A NOT with no condition after it.
     if (negated) return error.InvalidCondition;
-    if (current_conditions.items.len > 0) try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
+
+    // The last AND group is closed by the end of the tokens. It is empty only when there were
+    // no conditions at all.
+    if (current_conditions.items.len > 0) {
+        try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
+    }
     return groups.toOwnedSlice(allocator);
 }
 
+/// Parses the arguments after the program name. `allocator` should be an arena: nothing
+/// allocated here is freed individually.
 pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Command {
-    // All allocations go into an arena whose lifetime is tied to main(); no manual frees needed.
-    var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tokens: std.ArrayList([]const u8) = .empty;
     var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
 
-    var a: usize = 0;
-    while (a < args.len) : (a += 1) {
-        const arg = args[a];
+    // Options may appear anywhere. Everything else is a query token, in order.
+    var arg_index: usize = 0;
+    while (arg_index < args.len) : (arg_index += 1) {
+        const arg = args[arg_index];
         if (std.mem.eql(u8, arg, "--")) {
-            try tokens.appendSlice(allocator, args[a + 1 ..]);
+            // Everything after `--` is a query token, even if it starts with dashes.
+            try tokens.appendSlice(allocator, args[arg_index + 1 ..]);
             break;
         } else if (std.mem.eql(u8, arg, "--file")) {
-            a += 1;
-            if (a == args.len) return error.MissingFileValue;
-            config.file_path = args[a];
+            arg_index += 1;
+            if (arg_index == args.len) return error.MissingFileValue;
+            config.file_path = args[arg_index];
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            a += 1;
-            if (a == args.len) return error.MissingLimitValue;
-            config.limit = std.fmt.parseInt(usize, args[a], 10) catch return error.InvalidLimit;
+            arg_index += 1;
+            if (arg_index == args.len) return error.MissingLimitValue;
+            config.limit = std.fmt.parseInt(usize, args[arg_index], 10) catch return error.InvalidLimit;
         } else if (std.mem.eql(u8, arg, "--format")) {
-            a += 1;
-            if (a == args.len) return error.MissingFormatValue;
-            const fmt_str = args[a];
-            if (std.ascii.eqlIgnoreCase(fmt_str, "csv")) config.format = .csv else if (std.ascii.eqlIgnoreCase(fmt_str, "json")) config.format = .json else if (std.ascii.eqlIgnoreCase(fmt_str, "tsv")) config.format = .tsv else return error.InvalidFormat;
+            arg_index += 1;
+            if (arg_index == args.len) return error.MissingFormatValue;
+            config.format = for (std.enums.values(OutputFormat)) |format| {
+                if (std.ascii.eqlIgnoreCase(args[arg_index], @tagName(format))) break format;
+            } else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return .help;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -229,44 +250,45 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
         }
     }
 
-    var i: usize = 0;
-
-    if (i < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[i], "select")) {
-        i += 1;
-        const result = try parseSelectClause(allocator, tokens.items, i);
-        config.pluck = result.fields;
-        i = result.next_i;
+    // SELECT, if present, comes first among the query tokens.
+    var next_token: usize = 0;
+    if (next_token < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[next_token], "select")) {
+        next_token += 1;
+        const select = try parseSelectClause(allocator, tokens.items, next_token);
+        config.pluck = select.fields;
+        next_token = select.next_token;
     }
 
-    config.groups = try parseWhereClause(allocator, tokens.items, i);
+    config.groups = try parseWhereClause(allocator, tokens.items, next_token);
 
-    // Ensure that some action (filtering, plucking, or counting) was requested
-    if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) return error.MissingArguments;
+    if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) {
+        return error.MissingArguments;
+    }
     return .{ .run = config };
 }
 
 test "parseArgs flags and errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const allocator = arena.allocator();
 
-    try std.testing.expectError(error.InvalidLimit, parseArgs(a, &.{ "--limit", "x", "a", "exists" }));
-    try std.testing.expectError(error.UnknownOption, parseArgs(a, &.{ "--lmit", "5", "a", "exists" }));
-    try std.testing.expectError(error.InvalidSelectField, parseArgs(a, &.{ "SELECT", "sum:" }));
-    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "a", "exists", "AND" }));
-    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "a", "exists", "AND", "NOT" }));
-    try std.testing.expectError(error.MissingArguments, parseArgs(a, &.{}));
-    try std.testing.expectEqual(Command.help, try parseArgs(a, &.{ "a", "--help" }));
+    try std.testing.expectError(error.InvalidLimit, parseArgs(allocator, &.{ "--limit", "x", "a", "exists" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(allocator, &.{ "--lmit", "5", "a", "exists" }));
+    try std.testing.expectError(error.InvalidSelectField, parseArgs(allocator, &.{ "SELECT", "sum:" }));
+    try std.testing.expectError(error.InvalidCondition, parseArgs(allocator, &.{ "a", "exists", "AND" }));
+    try std.testing.expectError(error.InvalidCondition, parseArgs(allocator, &.{ "a", "exists", "AND", "NOT" }));
+    try std.testing.expectError(error.MissingArguments, parseArgs(allocator, &.{}));
+    try std.testing.expectEqual(Command.help, try parseArgs(allocator, &.{ "a", "--help" }));
 
     // `--` lets query terms start with dashes; negative numbers never needed it.
-    const dashed = (try parseArgs(a, &.{ "--", "--weird", "eq", "--x" })).run;
+    const dashed = (try parseArgs(allocator, &.{ "--", "--weird", "eq", "--x" })).run;
     try std.testing.expectEqualStrings("--weird", dashed.groups[0].conditions[0].key);
-    const negative = (try parseArgs(a, &.{ "balance", "gt", "-5" })).run;
+    const negative = (try parseArgs(allocator, &.{ "balance", "gt", "-5" })).run;
     try std.testing.expectEqualStrings("-5", negative.groups[0].conditions[0].val);
 
-    const not_not = (try parseArgs(a, &.{ "NOT", "NOT", "a", "exists" })).run;
+    const not_not = (try parseArgs(allocator, &.{ "NOT", "NOT", "a", "exists" })).run;
     try std.testing.expect(!not_not.groups[0].conditions[0].negated);
 
-    const limit0 = (try parseArgs(a, &.{ "--limit", "0", "a", "exists" })).run;
+    const limit0 = (try parseArgs(allocator, &.{ "--limit", "0", "a", "exists" })).run;
     try std.testing.expectEqual(@as(?usize, 0), limit0.limit);
 }

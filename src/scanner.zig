@@ -9,39 +9,18 @@ const values = @import("values.zig");
 const match = @import("match.zig");
 const output = @import("output.zig");
 
-const MultiFinder = finder.MultiFinder;
-const findNewline = finder.findNewline;
-const lastNewline = finder.lastNewline;
-const CompiledPlan = compile.CompiledPlan;
-const CompiledGroup = compile.CompiledGroup;
-const CompiledCondition = compile.CompiledCondition;
-const compilePlan = compile.compilePlan;
-const Value = values.Value;
-const Scratch = values.Scratch;
-const extractField = values.extractField;
-const slotValue = values.slotValue;
-const valueMatches = match.valueMatches;
-const nextPassing = match.nextPassing;
-const lineMatches = match.lineMatches;
-const evaluatePlan = match.evaluatePlan;
-const AggState = output.AggState;
-const accumulate = output.accumulate;
-const printFormatted = output.printFormatted;
-const printAggregations = output.printAggregations;
-const printHeader = output.printHeader;
-
-const BLOCK_SIZE = 8 * 1024 * 1024;
+const block_size = 8 * 1024 * 1024;
 /// Pipe input is handed over in small blocks: the consumer then scans data the reader just
 /// copied while it is still in L2. Measured ~20% faster than full blocks for `cat | zog`.
-const STREAM_BLOCK_SIZE = 128 * 1024;
+const stream_block_size = 128 * 1024;
 
 const Search = struct {
-    plan: *const CompiledPlan,
-    agg_states: []AggState,
+    plan: *const compile.CompiledPlan,
+    agg_states: []output.AggState,
     writer: *std.Io.Writer,
     /// Per anchor: whether it passed at the key occurrence being evaluated.
     passed: []bool,
-    scratch: Scratch,
+    scratch: values.Scratch,
     /// The exact layer. After a successful `exactLineMatches`, its slots hold the line's values.
     parser: *json.Parser,
     match_count: usize = 0,
@@ -52,26 +31,33 @@ const Search = struct {
         const reached = if (self.plan.limit) |limit| self.match_count >= limit else false;
         const plan = self.plan;
         if (plan.count_only) return reached;
-        const line = if (line_raw.len > 0 and line_raw[line_raw.len - 1] == '\r') line_raw[0 .. line_raw.len - 1] else line_raw;
+
+        // Strip one CR so CRLF input prints as LF.
+        const line = if (std.mem.endsWith(u8, line_raw, "\r")) line_raw[0 .. line_raw.len - 1] else line_raw;
         if (plan.pluck.len == 0) {
             try self.writer.writeAll(line);
             try self.writer.writeByte('\n');
             return reached;
         }
 
-        var results: [cli.MAX_PLUCK_FIELDS]?Value = undefined;
-        for (plan.pluck, 0..) |*pk, i| {
-            results[i] = if (plan.exact)
-                slotValue(self.parser.slots[pk.slot])
-            else if (pk.same_as) |j| results[j] else extractField(line, &pk.finder);
+        var results: [cli.max_pluck_fields]?values.Value = undefined;
+        for (plan.pluck, 0..) |*pluck, index| {
+            results[index] = if (plan.exact)
+                // The parser already decoded the line, so the value comes from its slot.
+                values.slotValue(self.parser.slots[pluck.slot])
+            else if (pluck.same_as) |earlier|
+                // The same field was selected before; reuse its result instead of extracting again.
+                results[earlier]
+            else
+                values.extractField(line, &pluck.finder);
         }
 
         if (plan.has_aggregations) {
-            for (results[0..plan.pluck.len], self.agg_states) |res, *state| {
-                if (res) |v| try accumulate(state, v, &self.scratch);
+            for (results[0..plan.pluck.len], self.agg_states) |result, *state| {
+                if (result) |value| try output.accumulate(state, value, &self.scratch);
             }
         } else {
-            try printFormatted(results[0..plan.pluck.len], plan.pluck, plan.format, self.writer);
+            try output.printFormatted(results[0..plan.pluck.len], plan.pluck, plan.format, self.writer);
         }
         return reached;
     }
@@ -81,6 +67,7 @@ const Search = struct {
     fn scanBlock(self: *Search, data: []const u8) !bool {
         const plan = self.plan;
         if (plan.exact) {
+            // Exact mode with prefilter gets the anchored scan, which may rule lines out at byte level.
             if (plan.anchors.len > 0 and plan.prefilter) return self.scanAnchored(true, data);
             return self.scanLines(true, data);
         }
@@ -98,61 +85,91 @@ const Search = struct {
     /// match.
     fn scanAnchored(self: *Search, comptime exact: bool, data: []const u8) !bool {
         const plan = self.plan;
-        var sol: usize = 0; // start of the first line not yet evaluated
+        // Start of the first line not yet evaluated. Every line before it is done, so
+        // searching for a newline never needs to look earlier than this.
+        var unscanned_start: usize = 0;
         var pos: usize = 0;
-        while (if (exact) plan.anchor_finder.nextOrHazard(data, pos) else plan.anchor_finder.next(data, pos)) |mh| {
-            const hazard = exact and mh.key == MultiFinder.hazard_key;
-            var any = hazard;
+
+        while (if (exact) plan.anchor_finder.nextOrHazard(data, pos) else plan.anchor_finder.next(data, pos)) |hit| {
+            const hazard = exact and hit.key == finder.MultiFinder.hazard_key;
+            var any_passed = hazard;
             if (!hazard) {
-                for (plan.anchors, plan.anchor_keys, self.passed) |a, ki, *p| {
-                    p.* = ki == mh.key and (a.op == .exists or try valueMatches(data[mh.hit.val_pos..], a, &self.scratch));
-                    any = any or p.*;
+                // Check every anchor whose key was found here. An anchor passes only if its
+                // value (not just its key) matches; `exists` needs the key alone.
+                for (plan.anchors, plan.anchor_keys, self.passed) |anchor, needle_index, *passed| {
+                    passed.* = needle_index == hit.key and
+                        (anchor.op == .exists or try match.valueMatches(data[hit.hit.val_pos..], anchor, &self.scratch));
+                    any_passed = any_passed or passed.*;
                 }
             }
-            if (!any) {
-                pos = mh.pos + 1;
+            if (!any_passed) {
+                // No anchor passed here, so no line can match at this occurrence. Move past it.
+                pos = hit.pos + 1;
                 continue;
             }
-            const ls = if (lastNewline(data, sol, mh.hit.key_pos)) |nl| nl + 1 else sol;
-            const le = std.mem.findScalarPos(u8, data, mh.hit.key_pos, '\n') orelse data.len;
-            const line = data[ls..le];
+
+            // The line runs from the newline before the key (or the unscanned start) to the next newline.
+            const line_start = if (finder.lastNewline(data, unscanned_start, hit.hit.key_pos)) |newline|
+                newline + 1
+            else
+                unscanned_start;
+            const line_end = std.mem.findScalarPos(u8, data, hit.hit.key_pos, '\n') orelse data.len;
+            const line = data[line_start..line_end];
             const matches = if (exact)
-                (hazard or plan.hazards.inLine(line) or try self.anchoredLineMatches(true, line, mh.hit.key_pos - ls)) and
+                // A hazard, or a hazard elsewhere in the line, means the bytes can't be trusted,
+                // so the byte-level check is skipped and the parser decides.
+                (hazard or
+                    plan.hazards.inLine(line) or
+                    try self.anchoredLineMatches(true, line, hit.hit.key_pos - line_start)) and
                     try self.exactLineMatches(line)
             else
-                try self.anchoredLineMatches(false, line, mh.hit.key_pos - ls);
+                try self.anchoredLineMatches(false, line, hit.hit.key_pos - line_start);
             if (matches) {
                 if (try self.emit(line)) return true;
             }
-            sol = @min(le + 1, data.len);
-            pos = sol;
+
+            // Continue after this line. Its newline is consumed too, so the next line starts cleanly.
+            unscanned_start = @min(line_end + 1, data.len);
+            pos = unscanned_start;
         }
         return false;
     }
 
-    /// Evaluates a line whose first passing anchor occurrence has its key at `off`. Groups
+    /// Evaluates a line whose first passing anchor occurrence has its key at `key_offset`. Groups
     /// whose anchor passed there only need their other conditions checked. Every anchor
     /// failed at all earlier occurrences, so the others only need the rest of the line searched.
     ///
     /// With `prefilter`, negated conditions are skipped: the bytes can show that a key is
     /// absent, not that the value at its path fails. The line must then be free of hazards.
-    fn anchoredLineMatches(self: *Search, comptime prefilter: bool, line: []const u8, off: usize) !bool {
+    fn anchoredLineMatches(self: *Search, comptime prefilter: bool, line: []const u8, key_offset: usize) !bool {
         const plan = self.plan;
-        for (plan.groups, plan.anchors, self.passed) |*group, anchor, p| {
-            if (p and try self.otherConditionsMatch(prefilter, line, group, anchor)) return true;
+        // Groups whose anchor passed at this occurrence: only the remaining conditions are left.
+        for (plan.groups, plan.anchors, self.passed) |*group, anchor, passed| {
+            if (passed and try self.otherConditionsMatch(prefilter, line, group, anchor)) return true;
         }
-        for (plan.groups, plan.anchors, self.passed) |*group, anchor, p| {
-            if (p) continue;
-            if (try nextPassing(anchor, line, off, &self.scratch) == null) continue;
+        // Other groups: their anchor has not passed yet. Every occurrence before `key_offset` was
+        // already checked for every anchor, so the anchor can only pass at or after `key_offset`.
+        for (plan.groups, plan.anchors, self.passed) |*group, anchor, passed| {
+            if (passed) continue;
+            if (try match.nextPassing(anchor, line, key_offset, &self.scratch) == null) continue;
             if (try self.otherConditionsMatch(prefilter, line, group, anchor)) return true;
         }
         return false;
     }
 
-    fn otherConditionsMatch(self: *Search, comptime prefilter: bool, line: []const u8, group: *const CompiledGroup, anchor: *const CompiledCondition) !bool {
+    /// Checks every condition in `group` except the anchor. With `prefilter`, negated
+    /// conditions are skipped too (see `anchoredLineMatches`).
+    fn otherConditionsMatch(
+        self: *Search,
+        comptime prefilter: bool,
+        line: []const u8,
+        group: *const compile.CompiledGroup,
+        anchor: *const compile.CompiledCondition,
+    ) !bool {
         for (group.conditions) |*cond| {
             if (cond == anchor or (prefilter and cond.negated)) continue;
-            if (try lineMatches(line, cond, &self.scratch) == cond.negated) return false;
+            // A condition fails when its result differs from its negation flag.
+            if (try match.lineMatches(line, cond, &self.scratch) == cond.negated) return false;
         }
         return true;
     }
@@ -164,8 +181,15 @@ const Search = struct {
         const slots = self.parser.slots;
         if (self.plan.groups.len == 0) return true;
         for (self.plan.groups) |*group| {
+            // `for ... else`: the else branch runs only when the loop never hit `break`, that is
+            // when every condition in this group passed. A `break` means this group failed, so
+            // the outer loop moves on to the next group (OR across groups, AND within one).
             for (group.conditions) |*cond| {
-                const pass = if (slots[cond.slot]) |vs| try valueMatches(vs, cond, &self.scratch) else false;
+                // A missing key (null slot) counts as a failed condition, so its negation passes.
+                const pass = if (slots[cond.slot]) |value|
+                    try match.valueMatches(value, cond, &self.scratch)
+                else
+                    false;
                 if (pass == cond.negated) break;
             } else return true;
         }
@@ -173,15 +197,18 @@ const Search = struct {
     }
 
     fn scanLines(self: *Search, comptime exact: bool, data: []const u8) !bool {
-        var sol: usize = 0;
-        while (sol < data.len) {
-            const nl = findNewline(data, sol);
-            const line = data[sol..nl];
-            const matches = if (exact) try self.exactLineMatches(line) else try evaluatePlan(line, self.plan, &self.scratch);
+        var line_start: usize = 0;
+        while (line_start < data.len) {
+            const newline = finder.findNewline(data, line_start);
+            const line = data[line_start..newline];
+            const matches = if (exact)
+                try self.exactLineMatches(line)
+            else
+                try match.evaluatePlan(line, self.plan, &self.scratch);
             if (matches) {
                 if (try self.emit(line)) return true;
             }
-            sol = nl + 1;
+            line_start = newline + 1;
         }
         return false;
     }
@@ -189,19 +216,31 @@ const Search = struct {
 
 const Buffer = struct { data: []u8, len: usize = 0, eof: bool = false };
 
+/// State shared by the reader thread and the consumer. The two sides hand the buffers
+/// back and forth with two semaphores:
+///   - `read_sem` counts buffers the reader may fill. It starts at 2, so both are free.
+///   - `fill_sem` counts filled buffers the consumer may scan.
+/// Both sides walk `bufs[0]` and `bufs[1]` in the same order, so neither side has to
+/// send the buffer index to the other.
 const ReaderCtx = struct {
     file: std.Io.File,
     io: std.Io,
     /// Input is a pipe or terminal: hand data over as soon as nothing more is immediately
     /// readable instead of waiting for a full block.
     streaming: bool,
+
     bufs: [2]Buffer,
+
+    /// Set by `abandonReader` to make the reader exit at its next check.
     stop: std.atomic.Value(bool) = .init(false),
     read_err: ?anyerror = null,
+
     fill_sem: std.Io.Semaphore = .{ .permits = 0 },
     read_sem: std.Io.Semaphore = .{ .permits = 2 },
 };
 
+/// True when a read on `file` would return without blocking. Always false on Windows, where
+/// the check is not implemented, so data is then gathered in full blocks.
 fn dataReady(file: std.Io.File) bool {
     if (builtin.os.tag == .windows) return false;
     var fds = [_]std.posix.pollfd{.{ .fd = file.handle, .events = std.posix.POLL.IN, .revents = 0 }};
@@ -213,13 +252,17 @@ fn dataReady(file: std.Io.File) bool {
 /// away). Always reads at least once. Returns true at end of input or on a read error.
 fn fillBuffer(ctx: *ReaderCtx, buf: *Buffer, total: *usize) bool {
     while (total.* < buf.data.len) {
-        const n = ctx.file.readStreaming(ctx.io, &.{buf.data[total.*..]}) catch |err| {
+        const read_len = ctx.file.readStreaming(ctx.io, &.{buf.data[total.*..]}) catch |err| {
+            // End of stream is a normal end of input, so only other errors are recorded.
             if (err != error.EndOfStream) ctx.read_err = err;
             return true;
         };
-        if (n == 0) return true;
-        total.* += n;
-        if (ctx.streaming and (total.* >= STREAM_BLOCK_SIZE or !dataReady(ctx.file))) return false;
+        if (read_len == 0) return true;
+
+        total.* += read_len;
+        // Streaming input: stop once a small block is full or the pipe has no more data right now.
+        const block_full = total.* >= stream_block_size;
+        if (ctx.streaming and (block_full or !dataReady(ctx.file))) return false;
     }
     return false;
 }
@@ -230,18 +273,24 @@ fn growBuffer(buf: *Buffer, new_len: usize) !void {
 
 fn readerThread(ctx: *ReaderCtx) void {
     const io = ctx.io;
-    var idx: usize = 0;
+    var buf_index: usize = 0;
     // Partial last line of the previously filled buffer. It sits past that buffer's `len`,
     // which the consumer never reads, so it can be copied straight into the next buffer.
+    // The other buffer is never resized in this round, so this slice stays valid until copied.
     var carry: []const u8 = &.{};
 
     while (true) {
+        // Wait until the consumer has released a buffer. Bail out if abandoned.
         ctx.read_sem.wait(io) catch return;
         if (ctx.stop.load(.acquire)) return;
-        const buf = &ctx.bufs[idx];
+        const buf = &ctx.bufs[buf_index];
 
-        if (carry.len + BLOCK_SIZE / 2 > buf.data.len) {
-            growBuffer(buf, carry.len + BLOCK_SIZE) catch |err| {
+        // Make room for the carry plus at least half a block of fresh data. Growing
+        // only when this fails keeps the common path free of reallocations.
+        if (carry.len + block_size / 2 > buf.data.len) {
+            growBuffer(buf, carry.len + block_size) catch |err| {
+                // Report the failure through the same path as end of input so the consumer
+                // exits instead of waiting for a buffer that will never come.
                 ctx.read_err = err;
                 buf.len = 0;
                 buf.eof = true;
@@ -251,18 +300,22 @@ fn readerThread(ctx: *ReaderCtx) void {
         }
         @memcpy(buf.data[0..carry.len], carry);
         var total = carry.len;
-        var scanned = carry.len; // the carried bytes contain no newline
+        // The carried bytes contain no newline, so the newline search can start after them.
+        var scanned = carry.len;
 
         while (true) {
             if (fillBuffer(ctx, buf, &total)) {
+                // End of input: the whole buffer, including a last line without a newline, is
+                // the final block. Nothing is carried over.
                 buf.len = total;
                 buf.eof = true;
                 ctx.fill_sem.post(io);
                 return;
             }
-            if (lastNewline(buf.data, scanned, total)) |nl| {
-                buf.len = nl + 1;
-                carry = buf.data[nl + 1 .. total];
+            if (finder.lastNewline(buf.data, scanned, total)) |newline| {
+                // Hand over everything up to the last newline. The rest is carried over.
+                buf.len = newline + 1;
+                carry = buf.data[newline + 1 .. total];
                 break;
             }
             // No complete line yet: keep reading, growing the buffer if a line outgrew it.
@@ -278,16 +331,16 @@ fn readerThread(ctx: *ReaderCtx) void {
             }
         }
         ctx.fill_sem.post(io);
-        idx = 1 - idx;
+        buf_index = 1 - buf_index;
     }
 }
 
 /// Returns true when all input was consumed, false when the match limit stopped it early.
 fn consume(search: *Search, ctx: *ReaderCtx, io: std.Io) !bool {
-    var idx: usize = 0;
+    var buf_index: usize = 0;
     while (true) {
         try ctx.fill_sem.wait(io);
-        const buf = &ctx.bufs[idx];
+        const buf = &ctx.bufs[buf_index];
         const limit_reached = try search.scanBlock(buf.data[0..buf.len]);
         // Flush per block so streaming input (`tail -f`) produces output as it arrives.
         try search.writer.flush();
@@ -296,8 +349,9 @@ fn consume(search: *Search, ctx: *ReaderCtx, io: std.Io) !bool {
             if (ctx.read_err) |err| return err;
             return true;
         }
+        // Release the buffer back to the reader and move to the other one.
         ctx.read_sem.post(io);
-        idx = 1 - idx;
+        buf_index = 1 - buf_index;
     }
 }
 
@@ -305,16 +359,25 @@ fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !void {
     // When we stop early the reader may be blocked in a read that never returns (e.g. on
     // `tail -f`), so it is detached rather than joined. Its context and buffers must then
     // outlive this function, so they come from page_allocator and are freed only after a join.
-    const pa = std.heap.page_allocator;
-    const ctx = try pa.create(ReaderCtx);
+    const page_allocator = std.heap.page_allocator;
+    const ctx = try page_allocator.create(ReaderCtx);
+    // Regular files are read in full blocks. Pipes, terminals and sockets are streamed.
+    // If stat fails, assume streaming, which is the safe choice for an unknown source.
+    const streaming = if (file.stat(io)) |stat| stat.kind != .file else |_| true;
+
+    const first_data = try page_allocator.alloc(u8, block_size);
+    errdefer page_allocator.free(first_data);
+    const second_data = try page_allocator.alloc(u8, block_size);
+
     ctx.* = .{
         .file = file,
         .io = io,
-        .streaming = if (file.stat(io)) |st| st.kind != .file else |_| true,
-        .bufs = .{ .{ .data = try pa.alloc(u8, BLOCK_SIZE) }, .{ .data = try pa.alloc(u8, BLOCK_SIZE) } },
+        .streaming = streaming,
+        .bufs = .{ .{ .data = first_data }, .{ .data = second_data } },
     };
     const thread = try std.Thread.spawn(.{}, readerThread, .{ctx});
 
+    // Consume on this thread. An early stop abandons the reader instead of joining it.
     const finished = consume(search, ctx, io) catch |err| {
         abandonReader(ctx, thread, io);
         return err;
@@ -322,11 +385,14 @@ fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !void {
     if (!finished) return abandonReader(ctx, thread, io);
 
     thread.join();
-    pa.free(ctx.bufs[0].data);
-    pa.free(ctx.bufs[1].data);
-    pa.destroy(ctx);
+    page_allocator.free(ctx.bufs[0].data);
+    page_allocator.free(ctx.bufs[1].data);
+    page_allocator.destroy(ctx);
 }
 
+/// Stops the reader without waiting for it. Setting `stop` and posting `read_sem` wakes a
+/// reader that is waiting for a free buffer. A reader blocked inside a read is not woken and
+/// keeps running until its read returns. Its memory is intentionally not freed.
 fn abandonReader(ctx: *ReaderCtx, thread: std.Thread, io: std.Io) void {
     ctx.stop.store(true, .release);
     ctx.read_sem.post(io);
@@ -336,21 +402,28 @@ fn abandonReader(ctx: *ReaderCtx, thread: std.Thread, io: std.Io) void {
 pub fn searchFile(allocator: std.mem.Allocator, config: cli.Config, writer: *std.Io.Writer, io: std.Io) !usize {
     const file = try std.Io.Dir.cwd().openFile(io, config.file_path.?, .{});
     defer file.close(io);
-    return try searchFileInternal(allocator, file, config, writer, io);
+    return try searchOpenFile(allocator, file, config, writer, io);
 }
 
 pub fn searchStream(allocator: std.mem.Allocator, config: cli.Config, writer: *std.Io.Writer, io: std.Io) !usize {
-    return try searchFileInternal(allocator, std.Io.File.stdin(), config, writer, io);
+    return try searchOpenFile(allocator, std.Io.File.stdin(), config, writer, io);
 }
 
-fn searchFileInternal(allocator: std.mem.Allocator, file: std.Io.File, config: cli.Config, writer: *std.Io.Writer, io: std.Io) !usize {
+/// Runs the query on an open file and writes its output. Returns the number of matching lines.
+fn searchOpenFile(
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    config: cli.Config,
+    writer: *std.Io.Writer,
+    io: std.Io,
+) !usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const plan = try compilePlan(arena.allocator(), config);
+    const plan = try compile.compilePlan(arena.allocator(), config);
 
-    var agg_states = try arena.allocator().alloc(AggState, plan.pluck.len);
-    for (plan.pluck, 0..) |p, i| {
-        agg_states[i] = switch (p.ptype) {
+    var agg_states = try arena.allocator().alloc(output.AggState, plan.pluck.len);
+    for (plan.pluck, 0..) |pluck, index| {
+        agg_states[index] = switch (pluck.ptype) {
             .raw => .raw,
             .count => .{ .count = 0 },
             .sum => .{ .sum = 0.0 },
@@ -360,10 +433,13 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.Io.File, config: c
         };
     }
 
-    try printHeader(&plan, writer);
+    try output.printHeader(&plan, writer);
 
+    // The parser and its slots live in the arena, so they outlive the reader thread's use.
     const parser = try arena.allocator().create(json.Parser);
-    parser.* = .{ .trie = &plan.trie, .slots = try arena.allocator().alloc(?[]const u8, plan.trie.slot_count) };
+    const slots = try arena.allocator().alloc(?[]const u8, plan.trie.slot_count);
+    parser.* = .{ .trie = &plan.trie, .slots = slots };
+
     var search: Search = .{
         .plan = &plan,
         .agg_states = agg_states,
@@ -372,20 +448,17 @@ fn searchFileInternal(allocator: std.mem.Allocator, file: std.Io.File, config: c
         .scratch = .{ .gpa = arena.allocator() },
         .parser = parser,
     };
+    // `--limit 0` can never produce output, so the reader thread is not started at all.
     const limit_zero = if (plan.limit) |limit| limit == 0 else false;
     if (!limit_zero) try runSearch(&search, file, io);
 
     if (plan.count_only) {
         try writer.print("{d}\n", .{search.match_count});
     } else if (plan.has_aggregations) {
-        try printAggregations(agg_states, plan.pluck, plan.format, writer);
+        try output.printAggregations(agg_states, plan.pluck, plan.format, writer);
     }
     return search.match_count;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -405,7 +478,7 @@ fn runTestQuery(a: std.mem.Allocator, input: []const u8, config: cli.Config) ![]
     defer file.close(io);
 
     var out: std.Io.Writer.Allocating = .init(a);
-    _ = try searchFileInternal(a, file, config, &out.writer, io);
+    _ = try searchOpenFile(a, file, config, &out.writer, io);
     return out.written();
 }
 
@@ -501,16 +574,16 @@ test "string eq is found by its value" {
 
 test "OR over several distinct keys" {
     const keys = [_][]const u8{ "a", "bb", "ccc", "dddd", "eeeee", "ffffff" };
-    var lines: std.ArrayListUnmanaged(u8) = .empty;
+    var lines: std.ArrayList(u8) = .empty;
     defer lines.deinit(testing.allocator);
     var expected3: usize = 0;
     var expected5: usize = 0;
     for (0..3000) |i| {
         // Varying padding puts the needles at every offset relative to the SIMD chunks.
         try lines.print(testing.allocator, "{{\"pad\":\"{s}\",\"{s}\":\"v{d}\"}}\n", .{ ("x" ** 40)[0 .. i % 37], keys[i % 6], i % 4 });
-        const k = i % 6;
-        if (k == 0 or k == 1 or (k == 2 and i % 4 == 1)) expected3 += 1;
-        if (k < 4 or (k == 4 and i % 4 == 2)) expected5 += 1;
+        const key_index = i % 6;
+        if (key_index == 0 or key_index == 1 or (key_index == 2 and i % 4 == 1)) expected3 += 1;
+        if (key_index < 4 or (key_index == 4 and i % 4 == 2)) expected5 += 1;
     }
     var buf: [32]u8 = undefined;
     try expectQuery(lines.items, &.{ "--count", "a", "exists", "OR", "bb", "exists", "OR", "ccc", "eq", "v1" }, try std.fmt.bufPrint(&buf, "{d}\n", .{expected3}));
@@ -573,7 +646,7 @@ test "last line without trailing newline is processed" {
 
 test "lines longer than a block are handled" {
     const a = testing.allocator;
-    const big = try a.alloc(u8, BLOCK_SIZE + BLOCK_SIZE / 2);
+    const big = try a.alloc(u8, block_size + block_size / 2);
     defer a.free(big);
     @memset(big, 'x');
     const input = try std.mem.concat(a, u8, &.{ "{\"a\":0}\n{\"pad\":\"", big, "\",\"a\":1}\n{\"a\":2}\n{\"a\":3}" });
@@ -584,15 +657,15 @@ test "lines longer than a block are handled" {
 
 test "many blocks with multi-condition and OR plans" {
     const a = testing.allocator;
-    var list: std.ArrayListUnmanaged(u8) = .empty;
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(a);
     var expected_and: usize = 0;
     var expected_or: usize = 0;
     var i: usize = 0;
-    while (list.items.len < 2 * BLOCK_SIZE + 12345) : (i += 1) {
-        const lvl = if (i % 7 == 0) "error" else "info";
+    while (list.items.len < 2 * block_size + 12345) : (i += 1) {
+        const level = if (i % 7 == 0) "error" else "info";
         const status = 200 + (i % 5) * 100;
-        try list.print(a, "{{\"i\":{d},\"level\":\"{s}\",\"status\":{d},\"msg\":\"some text {d}\"}}\n", .{ i, lvl, status, i });
+        try list.print(a, "{{\"i\":{d},\"level\":\"{s}\",\"status\":{d},\"msg\":\"some text {d}\"}}\n", .{ i, level, status, i });
         if (i % 7 == 0 and status >= 500) expected_and += 1;
         if (i % 7 == 0 or status == 300) expected_or += 1;
     }
@@ -670,7 +743,7 @@ test "exact: any JSON whitespace around colons" {
 const FuzzGen = struct {
     rand: std.Random,
     a: std.mem.Allocator,
-    out: std.ArrayListUnmanaged(u8) = .empty,
+    out: std.ArrayList(u8) = .empty,
 
     const keys = [_][]const u8{ "a", "b", "ab", "k/", "\u{e9}", "a.b", "p1", "q\"" };
     const strings = [_][]const u8{ "x", "ab", "Push", "1", "90", "90.0", "true", "a/b", "\u{e9}t\u{e9}", "q\"t", "", "-0", "\u{1f600}", "line\nbreak" };
@@ -705,9 +778,9 @@ const FuzzGen = struct {
         while (it.nextCodepoint()) |cp| {
             if (g.chance(5)) {
                 if (cp >= 0x10000) {
-                    const v = cp - 0x10000;
-                    try g.hex(@intCast(0xd800 + (v >> 10)));
-                    try g.hex(@intCast(0xdc00 + (v & 0x3ff)));
+                    const offset = cp - 0x10000;
+                    try g.hex(@intCast(0xd800 + (offset >> 10)));
+                    try g.hex(@intCast(0xdc00 + (offset & 0x3ff)));
                 } else try g.hex(cp);
             } else switch (cp) {
                 '"' => try g.print("\\\"", .{}),
@@ -782,7 +855,7 @@ test "differential: the prefilter never drops a line the parser accepts" {
         for (0..300) |_| try gen.line();
 
         for (0..40) |_| {
-            var args: std.ArrayListUnmanaged([]const u8) = .empty;
+            var args: std.ArrayList([]const u8) = .empty;
             const groups = 1 + rand.uintLessThan(u32, if (rand.boolean()) 2 else 6);
             for (0..groups) |gi| {
                 if (gi > 0) try args.append(a, "OR");
