@@ -570,6 +570,12 @@ test "string eq is found by its value" {
     // A value that could be a bare literal is still matched as one.
     try expectQuery("{\"v\":12}\n{\"v\":\"12\"}\n{\"v\":true}\n", &.{ "--count", "v", "eq", "12" }, "2\n");
     try expectQuery("{\"v\":12}\n{\"v\":\"12\"}\n{\"v\":true}\n", &.{ "--count", "v", "eq", "true", "OR", "v", "eq", "12" }, "3\n");
+
+    // An unterminated string ending in a backslash stops at the end of its line: the newline
+    // is not an escaped character, so the `{` on the next line is not part of the value.
+    const cut_off = "{\"a\":\"abc\\\n{\"b\":1}\n";
+    try expectQuery(cut_off, &.{ "--fast", "--count", "a", "has", "{" }, "0\n");
+    try expectQuery(cut_off, &.{ "--count", "a", "has", "{" }, "0\n");
 }
 
 test "OR over several distinct keys" {

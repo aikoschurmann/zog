@@ -105,8 +105,16 @@ pub fn stringContents(value: []const u8) StrContents {
             return .{ .raw = value[1..end], .escaped = escaped };
         }
         escaped = true;
-        end = @min(end + 2, value.len);
+        end = skipEscape(value, end);
     }
+}
+
+/// The position after the escape whose backslash is at `pos`. Skipping the escaped byte keeps
+/// an escaped quote from ending the string. A newline is never skipped, though: it is not part
+/// of an escape, and a value never extends past the end of its line.
+inline fn skipEscape(text: []const u8, pos: usize) usize {
+    if (pos + 1 < text.len and text[pos + 1] == '\n') return pos + 1;
+    return @min(pos + 2, text.len);
 }
 
 /// The decoded text of a string. A string without escapes is returned as a slice of the
@@ -154,15 +162,14 @@ fn extractValue(value: []const u8) ?Value {
                 pos = findStringSpecial(value, pos);
 
                 // An unterminated string ends at a newline or at the end of the input.
-                if (pos >= value.len or value[pos] == '\n') {
-                    return .{ .raw = value[1..@min(pos, value.len)], .is_string = true };
+                if (pos == value.len or value[pos] == '\n') {
+                    return .{ .raw = value[1..pos], .is_string = true };
                 }
                 if (value[pos] == '"') {
                     return .{ .raw = value[1..pos], .is_string = true };
                 }
 
-                // A backslash: skip it and the escaped character.
-                pos += 2;
+                pos = skipEscape(value, pos);
             }
         },
         '{', '[' => {
@@ -176,9 +183,9 @@ fn extractValue(value: []const u8) ?Value {
                 if (c == '\n') break;
                 if (in_string) {
                     // A backslash skips the next byte, so an escaped quote does not end the
-                    // string.
+                    // string. The newline that ends the line is never skipped.
                     if (c == '\\') {
-                        pos += 1;
+                        pos = skipEscape(value, pos) - 1;
                     } else if (c == '"') {
                         in_string = false;
                     }
@@ -198,7 +205,7 @@ fn extractValue(value: []const u8) ?Value {
                 }
             }
             // The value never closed. It runs up to the newline or the end of the input.
-            return .{ .raw = value[0..@min(pos, value.len)], .is_string = false };
+            return .{ .raw = value[0..pos], .is_string = false };
         },
         else => {
             // A bare number or literal ends at its first terminator.
@@ -228,6 +235,15 @@ pub fn slotValue(slot: ?[]const u8) ?Value {
 }
 
 const testing = std.testing;
+
+test "a backslash before a newline does not escape it" {
+    const contents = stringContents("\"abc\\\n{\"b\":1}");
+    try testing.expectEqualStrings("abc\\", contents.raw);
+    try testing.expect(contents.escaped);
+
+    try testing.expectEqualStrings("abc\\", extractValue("\"abc\\\n\"").?.raw);
+    try testing.expectEqualStrings("[\"x\\", extractValue("[\"x\\\n]").?.raw);
+}
 
 test "parseFastInt" {
     try testing.expectEqual(@as(?i64, -42), parseFastInt("-42"));
